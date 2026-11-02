@@ -775,6 +775,8 @@ class Player(QObject):
         self._pending_start = (0, 0.0)
         self._failed = False
         self._stopped = False
+        self._seeking = False
+        self._seek_until = 0.0
         self._mpvq = queue.Queue()
         self._mpvq_thread = threading.Thread(
             target=self._mpvq_loop, name="mpv-cmd", daemon=True
@@ -836,6 +838,10 @@ class Player(QObject):
                 lambda: self.mpv.command("seek", str(pos), "absolute")
             )
             self.resumed.emit(pos)
+
+        @self.mpv.event_callback("seek")
+        def _on_seek(_event):
+            self._seek_until = time.monotonic() + 2.0
 
         self._bind_keys()
         self._observe_fullscreen()
@@ -901,6 +907,7 @@ class Player(QObject):
                     and not self._loading
                     and not self._failed
                     and not self._stopped
+                    and not self.in_seek_grace()
                 ):
                     self.playback_idle.emit()
                 if self._loading:
@@ -951,8 +958,26 @@ class Player(QObject):
         except Exception as e:
             _dbg("observe buffering:", e)
 
+        def on_seeking(_name, value):
+            if value is None:
+                return
+            self._seeking = bool(value)
+            # Небольшая пауза после перемотки: mpv может кратко
+            # уходить в idle/eof и нельзя принимать это за конец серии.
+            self._seek_until = time.monotonic() + 2.0
+
+        try:
+            self.mpv.observe_property("seeking", on_seeking)
+        except Exception as e:
+            _dbg("observe seeking:", e)
+
         def on_eof_reached(_name, value):
-            if value and not self._failed and not self._stopped:
+            if (
+                value
+                and not self._failed
+                and not self._stopped
+                and not self.in_seek_grace()
+            ):
                 self.finished.emit()
 
         try:
@@ -965,6 +990,9 @@ class Player(QObject):
             self._loading = False
             self._has_video = True
             self.buffering.emit("")
+
+    def in_seek_grace(self) -> bool:
+        return self._seeking or time.monotonic() < self._seek_until
 
     def play(
         self, url: str, headers=None, proxy=None, title=None,
@@ -1432,6 +1460,7 @@ class MainWindow(QMainWindow):
         self._playing_sid = ""
         self._playing_eid = ""
         self._finish_latched = False
+        self._near_end_count = 0
         self._pending_selection = ("", "1", "1")
         self._startup_resume_url = ""
         self._autoplay_last_pending = False
@@ -2183,14 +2212,21 @@ class MainWindow(QMainWindow):
             pfc = False
 
         # Страховка, если mpv не прислал end-file: конец определяем
-        # по времени.
-        if (
+        # по времени. Требуем два подряд замера у конца, чтобы случайная
+        # перемотка/скачок позиции не запускали следующую серию.
+        near_end = (
             self._playing_key
-            and dur > 0
+            and dur >= 30.0
             and pos >= dur - 1.0
             and not self._finish_latched
-        ):
-            _log("polling finish:", pos, "/", dur)
+            and not self.player.in_seek_grace()
+        )
+        if near_end:
+            self._near_end_count += 1
+        else:
+            self._near_end_count = 0
+        if self._near_end_count >= 2:
+            _log("polling finish confirmed:", pos, "/", dur)
             self._on_finished()
             return
 
@@ -3269,6 +3305,7 @@ class MainWindow(QMainWindow):
         )
         self._playing_key = key
         self._finish_latched = False
+        self._near_end_count = 0
         self._playing_post_id = info.post_id if info is not None else ""
         self._playing_title = title
         self._playing_tid = tid
