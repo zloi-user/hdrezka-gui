@@ -742,6 +742,7 @@ class Player(QObject):
     buffering = pyqtSignal(str)
     resumed = pyqtSignal(float)
     finished = pyqtSignal()
+    playback_idle = pyqtSignal()
 
     MPV_KEYS = {
         "SPACE": "pause",
@@ -772,6 +773,8 @@ class Player(QObject):
         self._paused_for_cache = False
         self._cache_pct = None
         self._pending_start = (0, 0.0)
+        self._failed = False
+        self._stopped = False
         self._mpvq = queue.Queue()
         self._mpvq_thread = threading.Thread(
             target=self._mpvq_loop, name="mpv-cmd", daemon=True
@@ -806,14 +809,22 @@ class Player(QObject):
         @self.mpv.event_callback("end-file")
         def _on_end_file(event):
             data = getattr(event, "data", None)
-            reason = data.get("reason") if isinstance(data, dict) else data
+            # python-mpv отдаёт MpvEventEndFile с числовым reason:
+            # 0 = EOF, 4 = ERROR. Старые версии могли отдавать dict.
+            reason = getattr(data, "reason", None)
+            if reason is None and isinstance(data, dict):
+                reason = data.get("reason")
+            _log("end-file reason:", reason)
             self._loading = False
             self._has_video = False
             self.buffering.emit("")
-            if reason == "eof":
+            if reason in (0, "eof"):
                 self.finished.emit()
-            elif reason == "error":
+            elif reason in (4, "error"):
+                self._failed = True
                 self.failed.emit("ошибка воспроизведения потока")
+            elif reason in (2, 3, "aborted", "quit"):
+                self._stopped = True
 
         @self.mpv.event_callback("file-loaded")
         def _on_file_loaded(_event):
@@ -884,9 +895,17 @@ class Player(QObject):
         def on_core_idle(_name, value):
             if value is None:
                 return
-            if value and self._loading:
-                self.buffering.emit("Открытие потока…")
-            elif not value and self._loading and not self._has_video:
+            if value:
+                if (
+                    self._has_video
+                    and not self._loading
+                    and not self._failed
+                    and not self._stopped
+                ):
+                    self.playback_idle.emit()
+                if self._loading:
+                    self.buffering.emit("Открытие потока…")
+            elif self._loading and not self._has_video:
                 self.buffering.emit("Подготовка потока…")
 
         def on_paused(_name, value):
@@ -932,6 +951,15 @@ class Player(QObject):
         except Exception as e:
             _dbg("observe buffering:", e)
 
+        def on_eof_reached(_name, value):
+            if value and not self._failed and not self._stopped:
+                self.finished.emit()
+
+        try:
+            self.mpv.observe_property("eof-reached", on_eof_reached)
+        except Exception as e:
+            _dbg("observe eof-reached:", e)
+
         @self.mpv.event_callback("playback-restart")
         def _on_playback_restart(_event):
             self._loading = False
@@ -950,6 +978,8 @@ class Player(QObject):
         self._has_video = False
         self._paused_for_cache = False
         self._cache_pct = None
+        self._failed = False
+        self._stopped = False
         self._pending_start = (self._play_seq, float(start_pos or 0.0))
         self.buffering.emit("Подготовка потока…")
         self._defer_play(url, self._play_seq, 0, headers, proxy, title)
@@ -958,6 +988,7 @@ class Player(QObject):
         self._play_seq += 1
         self._loading = False
         self._has_video = False
+        self._stopped = True
         self._pending_start = (0, 0.0)
         self.buffering.emit("")
         if self.mpv is not None:
@@ -1400,6 +1431,7 @@ class MainWindow(QMainWindow):
         self._playing_tid = ""
         self._playing_sid = ""
         self._playing_eid = ""
+        self._finish_latched = False
         self._pending_selection = ("", "1", "1")
         self._startup_resume_url = ""
         self._autoplay_last_pending = False
@@ -1457,6 +1489,7 @@ class MainWindow(QMainWindow):
         self.player.buffering.connect(self._on_buffering)
         self.player.resumed.connect(self._on_resumed)
         self.player.finished.connect(self._on_finished)
+        self.player.playback_idle.connect(self._on_playback_idle)
         if self.player.mpv is None:
             QTimer.singleShot(
                 0,
@@ -2005,21 +2038,37 @@ class MainWindow(QMainWindow):
             return pos
         return 0.0
 
-    def _read_mpv_position(self):
+    def _mpv_time_pos(self):
         if self.player.mpv is None:
             return None
+        for name in ("time_pos", "playback_time"):
+            try:
+                value = getattr(self.player.mpv, name)
+            except Exception:
+                continue
+            if value is None:
+                continue
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _read_mpv_position(self):
+        if self.player.mpv is None:
+            _log("position: mpv is None")
+            return None
+        pos = self._mpv_time_pos()
+        if pos is None:
+            try:
+                dur = self.player.mpv.duration
+            except Exception:
+                dur = None
+            _log("position: time_pos is None, duration", repr(dur))
+            return None
         try:
-            pos = self.player.mpv.time_pos
-            dur = self.player.mpv.duration
+            dur = float(self.player.mpv.duration or 0)
         except Exception:
-            return None
-        try:
-            pos = float(pos)
-        except (TypeError, ValueError):
-            return None
-        try:
-            dur = float(dur or 0)
-        except (TypeError, ValueError):
             dur = 0.0
         return pos, dur
 
@@ -2063,8 +2112,14 @@ class MainWindow(QMainWindow):
         _log("save:", key, round(pos, 1), "of", round(dur, 1))
 
     def _on_finished(self):
+        if not self._playing_key:
+            return
+        self._finish_latched = True
         key = self._playing_key
-        _log("finished:", key)
+        _log(
+            "finished:", key,
+            "sid/eid:", self._playing_sid, self._playing_eid,
+        )
         self._hide_overlay()
         if key and key in self._positions:
             self._positions.pop(key, None)
@@ -2072,6 +2127,24 @@ class MainWindow(QMainWindow):
         self._playing_key = ""
         self.playback_label.setText("Остановлено")
         self._maybe_autoplay_next()
+
+    def _on_playback_idle(self):
+        if self._closing or not self._playing_key or self._finish_latched:
+            return
+        QTimer.singleShot(200, self._confirm_idle_finish)
+
+    def _confirm_idle_finish(self):
+        if self._closing or not self._playing_key or self._finish_latched:
+            return
+        try:
+            failed = self.player._failed
+            stopped = self.player._stopped
+        except Exception:
+            failed = stopped = False
+        if failed or stopped:
+            return
+        _log("idle -> finish")
+        self._on_finished()
 
     def _update_playback_info(self):
         if self.player.mpv is None:
@@ -2092,13 +2165,9 @@ class MainWindow(QMainWindow):
                 else:
                     self.playback_label.setText("Остановлено")
             return
-        try:
-            pos = self.player.mpv.time_pos
-        except Exception:
-            return
-        try:
-            pos = float(pos)
-        except (TypeError, ValueError):
+        pos = self._mpv_time_pos()
+        if pos is None:
+            _log("info: time_pos is None")
             return
         try:
             dur = float(self.player.mpv.duration or 0)
@@ -2112,6 +2181,18 @@ class MainWindow(QMainWindow):
             pfc = bool(self.player.mpv.paused_for_cache)
         except Exception:
             pfc = False
+
+        # Страховка, если mpv не прислал end-file: конец определяем
+        # по времени.
+        if (
+            self._playing_key
+            and dur > 0
+            and pos >= dur - 1.0
+            and not self._finish_latched
+        ):
+            _log("polling finish:", pos, "/", dur)
+            self._on_finished()
+            return
 
         # Видео реально пошло — таймер «HLS не стартовал» больше не нужен.
         if pos > 0.5:
@@ -2170,6 +2251,7 @@ class MainWindow(QMainWindow):
     def _next_episode_after(self, sid: str, eid: str):
         info = self._title_info
         if info is None or not info.is_series:
+            _log("next_after: no series info")
             return None
         seasons = dict(self._seasons or {})
         if not seasons:
@@ -2178,6 +2260,7 @@ class MainWindow(QMainWindow):
                 for k in (self._episodes or {})
             }
         if not seasons:
+            _log("next_after: no seasons")
             return None
 
         season_ids = sorted(seasons.keys(), key=self._season_sort_key)
@@ -2189,6 +2272,7 @@ class MainWindow(QMainWindow):
                 or (season_ids[0] if season_ids else "")
             )
         if sid not in season_ids:
+            _log("next_after: season not found", sid, season_ids)
             return None
 
         idx = season_ids.index(sid)
@@ -2202,6 +2286,10 @@ class MainWindow(QMainWindow):
                 cur_pos = i
                 break
         if cur_pos < 0:
+            _log(
+                "next_after: episode not found",
+                eid, [e.episode_id for e in cur_eps],
+            )
             return None
 
         if cur_pos + 1 < len(cur_eps):
@@ -2229,25 +2317,38 @@ class MainWindow(QMainWindow):
                 "season_name": seasons.get(nsid, f"Сезон {nsid}"),
                 "episode_name": nxt.name,
             }
+        _log("next_after: no next season", sid)
         return None
 
     def _maybe_autoplay_next(self):
         info = self._title_info
+        _log(
+            "autoplay check:",
+            "series=", bool(info and info.is_series),
+            "post=", info.post_id if info is not None else None,
+            "playing_post=", self._playing_post_id,
+            "playing_sid/eid=", self._playing_sid, self._playing_eid,
+            "enabled=", self.settings.value(
+                "autoplay_next", True, type=bool
+            ),
+        )
         if info is None or not info.is_series:
             return
         if (
             self._playing_post_id
             and info.post_id != self._playing_post_id
         ):
-            # Старый поток доиграл, пока пользователь уже открыл другой тайтл.
+            _log("autoplay: post_id mismatch")
             return
         if not self.settings.value(
             "autoplay_next", True, type=bool
         ):
+            _log("autoplay: disabled in settings")
             return
         nxt = self._next_episode_after(
             self._playing_sid, self._playing_eid
         )
+        _log("autoplay next:", nxt)
         if nxt is None:
             self.stream_status.setText("Это была последняя серия")
             return
@@ -2261,6 +2362,7 @@ class MainWindow(QMainWindow):
         self._start_next_countdown(nxt, seconds)
 
     def _start_next_countdown(self, nxt: dict, seconds: int):
+        _log("countdown start:", nxt, seconds)
         self._startup_timer.stop()
         self._hide_overlay()
         self._next_episode = nxt
@@ -2293,6 +2395,7 @@ class MainWindow(QMainWindow):
             return
         self._next_remaining -= 1
         if self._next_remaining <= 0:
+            _log("countdown done, play next")
             self._next_timer.stop()
             self.next_overlay.hide()
             try:
@@ -2315,6 +2418,7 @@ class MainWindow(QMainWindow):
             self._next_timer.isActive()
             or self.next_overlay.isVisible()
         )
+        _log("cancel next timer: active=", active, "quiet=", quiet)
         self._next_timer.stop()
         self.next_overlay.hide()
         try:
@@ -3040,6 +3144,7 @@ class MainWindow(QMainWindow):
         info = self._title_info
         if info is None:
             return
+        _log("play_current:", self._selection(info))
         self._autoplay_last_pending = False
         if self.player.mpv is None:
             QMessageBox.warning(
@@ -3163,6 +3268,7 @@ class MainWindow(QMainWindow):
             if info is not None and tid else ""
         )
         self._playing_key = key
+        self._finish_latched = False
         self._playing_post_id = info.post_id if info is not None else ""
         self._playing_title = title
         self._playing_tid = tid
