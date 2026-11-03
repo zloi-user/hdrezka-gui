@@ -849,6 +849,7 @@ class HDrezkaClient:
         self._access_ok = False
         self.challenge_count = 0
         self.session = requests.Session()
+        self.session.verify = False
         self.session.headers.update(
             {
                 "User-Agent": USER_AGENT,
@@ -882,7 +883,7 @@ class HDrezkaClient:
                     url,
                     headers=headers,
                     proxies=self._proxies(),
-                    verify=self.proxy is None,
+                    verify=False,
                     timeout=(min(15.0, self.timeout), self.timeout),
                     allow_redirects=True,
                     **kwargs,
@@ -1213,3 +1214,33 @@ class HDrezkaClient:
             subtitles=parse_subtitles(payload.get("subtitle")),
             expires=exp_from_url(first.url),
         )
+
+
+def fetch_bytes(
+    url: str,
+    proxy: Optional[str] = None,
+    referer: Optional[str] = None,
+    timeout: float = 20.0,
+) -> bytes:
+    """Загружает произвольный URL (постер) с тем же прокси и без проверки TLS."""
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "image/avif,image/webp,image/png,image/*,*/*;q=0.8",
+    }
+    if referer:
+        headers["Referer"] = referer
+    proxies = {"http": proxy, "https": proxy} if proxy else {}
+    session = requests.Session()
+    try:
+        resp = session.get(
+            url,
+            headers=headers,
+            proxies=proxies,
+            verify=False,
+            timeout=(min(10.0, timeout), timeout),
+            allow_redirects=True,
+        )
+        resp.raise_for_status()
+        return resp.content
+    finally:
+        session.close()

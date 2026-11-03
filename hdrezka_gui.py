@@ -46,14 +46,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from PyQt6.QtCore import (
-        QObject, QSettings, QStandardPaths, Qt, QThread, QTimer, QUrl,
+        QObject, QSettings, QStandardPaths, Qt, QThread, QTimer,
         pyqtSignal,
     )
     from PyQt6.QtGui import (
         QBrush, QColor, QCursor, QKeySequence, QOpenGLContext, QPixmap,
         QShortcut,
     )
-    from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
@@ -66,6 +65,7 @@ except ImportError:  # pragma: no cover
     sys.exit("Не найден PyQt6. Установите: python3 -m pip install PyQt6")
 
 import hdrezka_core as core
+from proxy_bridge import ProxyBridge
 from screen_inhibitor import ScreenInhibitor
 
 # --------------------------------------------------------------------------
@@ -377,8 +377,18 @@ class CheckWorker(QThread):
 
     def run(self):
         client = None
+        bridge = None
         try:
-            client = core.HDrezkaClient(self.base, self.proxy, 20.0)
+            proxy = self.proxy
+            if proxy:
+                scheme = urllib.parse.urlparse(proxy).scheme.lower()
+                if scheme.startswith("socks"):
+                    try:
+                        bridge = ProxyBridge(proxy)
+                        proxy = bridge.url
+                    except Exception as e:
+                        _dbg("check proxy bridge:", e)
+            client = core.HDrezkaClient(self.base, proxy, 20.0)
             items = client.fetch_home()
             self.done.emit(
                 True, f"Сайт доступен. Тайтлов на главной: {len(items)}"
@@ -388,6 +398,32 @@ class CheckWorker(QThread):
         finally:
             if client is not None:
                 client.close()
+            if bridge is not None:
+                bridge.close()
+
+
+class PosterWorker(QThread):
+    done = pyqtSignal(str, bytes)
+
+    def __init__(
+        self, url: str, proxy: Optional[str], referer: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.url = url
+        self.proxy = proxy
+        self.referer = referer
+
+    def run(self):
+        try:
+            data = core.fetch_bytes(
+                self.url, proxy=self.proxy,
+                referer=self.referer, timeout=20.0,
+            )
+        except Exception as e:
+            _dbg("poster:", e)
+            data = b""
+        self.done.emit(self.url, data)
 
 
 _PROXY_WORKERS = set()
@@ -1194,12 +1230,13 @@ class SettingsDialog(QDialog):
             "зеркало (например, https://hdrezka.co)."
         )
 
-        self.proxy_check = QCheckBox("Прокси для API и mpv:")
+        self.proxy_check = QCheckBox("Прокси для всех запросов:")
         self.proxy_edit = QLineEdit()
-        self.proxy_edit.setPlaceholderText("http://127.0.0.1:8080")
+        self.proxy_edit.setPlaceholderText("socks5://127.0.0.1:1080")
         self.proxy_edit.setToolTip(
-            "Необязательно. Используется для запросов к сайту и для mpv. "
-            "Поддерживаются http:// и socks://."
+            "Необязательно. Используется для сайта, постеров и mpv. "
+            "Поддерживаются http://, https://, socks4://, socks4a://, "
+            "socks5:// и socks5h://. TLS-сертификаты не проверяются."
         )
 
         self.quality_label = QLabel("Макс. качество:")
@@ -1300,10 +1337,11 @@ class SettingsDialog(QDialog):
         hint = QLabel(
             "Сайт закрыт проверкой Anubis (proof-of-work). Клиент решает её "
             "сам, без браузера. Если домен не открывается, смените зеркало "
-            "или включите прокси. PRO-качества без подписки могут не играть. "
+            "или включите прокси: он применяется ко всем запросам, включая "
+            "постеры и mpv. Для socks4/socks5/https-прокси автоматически "
+            "поднимается локальный мост. TLS-сертификаты не проверяются. "
             "«Авто» сначала пробует HLS, а если первый сегмент не открылся "
-            "за 10 секунд — переключается на прямой MP4. Автозапуск "
-            "показывает плашку с таймером и запускает следующую серию."
+            "за 10 секунд — переключается на прямой MP4."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#777;")
@@ -1494,6 +1532,8 @@ class MainWindow(QMainWindow):
         )
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
+        self._proxy_bridge = None
+        self._proxy_bridge_key = ""
         self.client = self._new_client()
         self.screen_inhibitor = ScreenInhibitor()
 
@@ -1548,7 +1588,6 @@ class MainWindow(QMainWindow):
         self._search_worker = None
 
         self._poster_cache: Dict[str, QPixmap] = {}
-        self._poster_replies = {}
         self._poster_url = ""
 
         self._fullscreen = False
@@ -1581,7 +1620,6 @@ class MainWindow(QMainWindow):
 
         self._load_positions()
         self._build_ui()
-        self._poster_mgr = QNetworkAccessManager(self)
         self.settings_dlg = SettingsDialog(self.settings, self)
         self.player = Player(
             mpv_module, self.video, self._mpv_options(), self
@@ -1677,12 +1715,55 @@ class MainWindow(QMainWindow):
             return None
         return normalize_proxy(self.settings.value("proxy", "", type=str))
 
+    def _stop_proxy_bridge(self):
+        bridge = self._proxy_bridge
+        self._proxy_bridge = None
+        self._proxy_bridge_key = ""
+        if bridge is not None:
+            try:
+                bridge.close()
+            except Exception as e:
+                _dbg("proxy bridge close:", e)
+
+    def _ensure_proxy_bridge(self, proxy: str):
+        if (
+            self._proxy_bridge is not None
+            and self._proxy_bridge_key == proxy
+            and self._proxy_bridge.alive
+        ):
+            return self._proxy_bridge
+        self._stop_proxy_bridge()
+        try:
+            bridge = ProxyBridge(proxy)
+        except Exception as e:
+            _dbg("proxy bridge:", e)
+            return None
+        self._proxy_bridge = bridge
+        self._proxy_bridge_key = proxy
+        return bridge
+
+    def _client_proxy(self) -> Optional[str]:
+        """Прокси для requests: socks/https идут через локальный мост."""
+        proxy = self._proxy_url()
+        if not proxy:
+            self._stop_proxy_bridge()
+            return None
+        scheme = urllib.parse.urlparse(proxy).scheme.lower()
+        if scheme == "http":
+            self._stop_proxy_bridge()
+            return proxy
+        bridge = self._ensure_proxy_bridge(proxy)
+        if bridge is not None:
+            return bridge.url
+        # PySocks может быть не установлен; пусть requests попробует сам.
+        return proxy
+
     def _new_client(self) -> core.HDrezkaClient:
         return core.HDrezkaClient(
             base=normalize_base(
                 self.settings.value("base_url", core.DEFAULT_BASE, type=str)
             ),
-            proxy=self._proxy_url(),
+            proxy=self._client_proxy(),
             timeout=30.0,
         )
 
@@ -1700,6 +1781,7 @@ class MainWindow(QMainWindow):
             "input_default_bindings": False,
             "input_vo_keyboard": True,
             "user_agent": core.USER_AGENT,
+            "tls_verify": False,
             "referrer": normalize_base(
                 self.settings.value("base_url", core.DEFAULT_BASE, type=str)
             ) + "/",
@@ -1715,10 +1797,16 @@ class MainWindow(QMainWindow):
     def _mpv_proxy(self) -> Optional[str]:
         proxy = self._proxy_url()
         if not proxy:
+            self._stop_proxy_bridge()
             return None
         scheme = urllib.parse.urlparse(proxy).scheme.lower()
-        if scheme in ("http", "socks", "socks5", "socks5h"):
+        if scheme == "http":
+            # mpv умеет только http://-прокси.
+            self._stop_proxy_bridge()
             return proxy
+        bridge = self._ensure_proxy_bridge(proxy)
+        if bridge is not None:
+            return bridge.url
         return None
 
     def reset_session(self):
@@ -2231,7 +2319,7 @@ class MainWindow(QMainWindow):
         self.playback_label.setText("Остановлено")
         self._maybe_autoplay_next()
         if not self._next_timer.isActive() and not self._stream_loading:
-            self.screen_inhibitor.release()
+            self.screen_inhibitor.release_async()
 
     def _on_playback_idle(self):
         if self._closing or not self._playing_key or self._finish_latched:
@@ -2539,7 +2627,7 @@ class MainWindow(QMainWindow):
             pass
         self._next_episode = None
         if not self._playing_key and not self._stream_loading:
-            self.screen_inhibitor.release()
+            self.screen_inhibitor.release_async()
         if active and not quiet:
             self.stream_status.setText(
                 "Автозапуск следующей серии отменён"
@@ -3285,7 +3373,7 @@ class MainWindow(QMainWindow):
             sid, eid = "1", "1"
 
         self._stream_loading = True
-        self.screen_inhibitor.acquire()
+        self.screen_inhibitor.acquire_async()
         self._cancel_next_timer(quiet=True)
         self._startup_timer.stop()
         self._resume_timer.stop()
@@ -3313,7 +3401,7 @@ class MainWindow(QMainWindow):
         self.play_btn.setEnabled(True)
         err = (result or {}).get("error") or ""
         if err:
-            self.screen_inhibitor.release()
+            self.screen_inhibitor.release_async()
             self._startup_timer.stop()
             self._hide_overlay()
             self.stream_status.setText("Ошибка: " + err)
@@ -3386,7 +3474,7 @@ class MainWindow(QMainWindow):
             if info is not None and tid else ""
         )
         self._playing_key = key
-        self.screen_inhibitor.acquire()
+        self.screen_inhibitor.acquire_async()
         self._finish_latched = False
         self._near_end_count = 0
         self._playing_post_id = info.post_id if info is not None else ""
@@ -3480,7 +3568,8 @@ class MainWindow(QMainWindow):
         proxy = self._mpv_proxy()
         if self._proxy_url() and not proxy:
             self.statusBar().showMessage(
-                "https-прокси не передан в mpv (нужен http:// или socks://)",
+                "Не удалось поднять прокси-мост для mpv; "
+                "видео пойдёт напрямую",
                 10000,
             )
         self.player.play(
@@ -3605,7 +3694,7 @@ class MainWindow(QMainWindow):
         self._startup_timer.stop()
         self._hide_overlay()
         self._stream_loading = False
-        self.screen_inhibitor.release()
+        self.screen_inhibitor.release_async()
         self.stream_status.setText("Ошибка mpv: " + text)
         self.statusBar().showMessage("Ошибка mpv: " + text)
 
@@ -3665,26 +3754,14 @@ class MainWindow(QMainWindow):
             return
         name = self._title_info.title if self._title_info else "…"
         self._set_poster_placeholder(name)
-        req = QNetworkRequest(QUrl(url))
-        req.setRawHeader(b"User-Agent", core.USER_AGENT.encode())
-        req.setRawHeader(
-            b"Referer", (self.client.base + "/").encode()
+        worker = PosterWorker(
+            url, self._client_proxy(), self.client.base + "/"
         )
-        try:
-            req.setTransferTimeout(15000)
-        except AttributeError:
-            pass
-        reply = self._poster_mgr.get(req)
-        self._poster_replies[reply] = url
-        reply.finished.connect(lambda r=reply: self._on_poster_reply(r))
+        worker.done.connect(self._on_poster_data)
+        self._track_worker(worker)
+        worker.start()
 
-    def _on_poster_reply(self, reply):
-        url = self._poster_replies.pop(reply, "")
-        try:
-            data = bytes(reply.readAll())
-        except Exception:
-            data = b""
-        reply.deleteLater()
+    def _on_poster_data(self, url, data):
         if not data:
             return
         pix = QPixmap()
@@ -3826,6 +3903,7 @@ class MainWindow(QMainWindow):
             self._startup_timer.stop()
             self._cancel_next_timer(quiet=True)
             self._hide_overlay()
+            self._stop_proxy_bridge()
             self.client = self._new_client()
             self._poster_cache.clear()
             self._poster_url = ""
@@ -3871,7 +3949,8 @@ class MainWindow(QMainWindow):
         self.next_overlay.hide()
         self.save_position()
         try:
-            self.screen_inhibitor.release()
+            self.screen_inhibitor.release_async(wait=2.0)
+            self.screen_inhibitor.shutdown()
         except Exception:
             pass
         self._hide_overlay()
@@ -3901,6 +3980,7 @@ class MainWindow(QMainWindow):
                     w.wait(500)
                 except Exception:
                     pass
+        self._stop_proxy_bridge()
         try:
             self.client.close()
         except Exception:
