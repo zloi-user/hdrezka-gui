@@ -1044,7 +1044,8 @@ class HDrezkaClient:
         return parse_catalog_html(resp.text, self.base)
 
     def fetch_catalog(
-        self, section: str, page: int = 1, genre: str = ""
+        self, section: str, page: int = 1, genre: str = "",
+        year: str = "",
     ) -> Tuple[List[SearchItem], bool, List[Tuple[str, str]]]:
         section = (section or "films").strip("/")
         path_section = SECTION_PATHS.get(section, section)
@@ -1053,9 +1054,18 @@ class HDrezkaClient:
                 "для главной страницы используйте fetch_home()"
             )
         genre = (genre or "").strip("/")
-        base = f"/{path_section}/"
-        if genre:
-            base = f"/{path_section}/{genre}/"
+        year = (year or "").strip("/")
+        if year:
+            # Год на сайте есть только в подборках «Лучшее»:
+            # /films/best/2024/, /films/best/action/2024/.
+            base = f"/{path_section}/best/"
+            if genre:
+                base += f"{genre}/"
+            base += f"{year}/"
+        else:
+            base = f"/{path_section}/"
+            if genre:
+                base += f"{genre}/"
         path = base if page <= 1 else f"{base}page/{page}/"
         resp = self.request("GET", path)
         if resp.status_code >= 400:

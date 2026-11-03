@@ -23,17 +23,20 @@ API-логика и решение Anubis — в hdrezka_core.py (без бра�
 from __future__ import annotations
 
 import ctypes
+import faulthandler
 import io
 import json
 import locale
 import os
 import queue
+import signal
 import subprocess
 import sys
 import threading
 import time
 import traceback
 import urllib.parse
+from collections import deque
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -50,8 +53,8 @@ try:
         pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QBrush, QColor, QCursor, QKeySequence, QOpenGLContext, QPixmap,
-        QShortcut,
+        QBrush, QColor, QCursor, QIcon, QKeySequence, QOpenGLContext,
+        QPixmap, QShortcut,
     )
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtWidgets import (
@@ -115,6 +118,31 @@ def _dbg(*args):
 def _log(*args):
     if os.environ.get("HDREZKA_LOG"):
         print("[hdrezka]", *args, file=sys.stderr)
+
+
+_HANG_LOG_FILE = None
+
+
+def setup_faulthandler():
+    """Пишет стеки при SIGUSR1 и фатальных ошибках в hang.log."""
+    global _HANG_LOG_FILE
+    try:
+        path = os.path.join(
+            os.path.expanduser("~/.cache/hdrezka-gui"), "hang.log"
+        )
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        _HANG_LOG_FILE = open(path, "a", buffering=1, encoding="utf-8")
+        faulthandler.enable(file=_HANG_LOG_FILE, all_threads=True)
+        if hasattr(signal, "SIGUSR1"):
+            faulthandler.register(
+                signal.SIGUSR1,
+                file=_HANG_LOG_FILE,
+                all_threads=True,
+                chain=False,
+            )
+        _log("hang log:", path, "(kill -USR1 для дампа)")
+    except Exception as e:
+        _log("faulthandler setup:", e)
 
 
 # --------------------------------------------------------------------------
@@ -189,6 +217,21 @@ def initials(name: str) -> str:
     return "?"
 
 
+def themed_icon(widget, theme_names, standard):
+    """Иконка из темы с fallback на стандартную иконку Qt."""
+    for name in theme_names:
+        try:
+            icon = QIcon.fromTheme(name)
+        except Exception:
+            icon = QIcon()
+        if not icon.isNull():
+            return icon
+    try:
+        return widget.style().standardIcon(standard)
+    except Exception:
+        return QIcon()
+
+
 # --------------------------------------------------------------------------
 # Фоновые потоки
 # --------------------------------------------------------------------------
@@ -198,13 +241,14 @@ class CatalogWorker(QThread):
 
     def __init__(
         self, client, section: str, page: int, genre: str,
-        token: int, parent=None,
+        year: str, token: int, parent=None,
     ):
         super().__init__(parent)
         self.client = client
         self.section = section
         self.page = page
         self.genre = genre
+        self.year = year
         self.token = token
 
     def run(self):
@@ -215,7 +259,7 @@ class CatalogWorker(QThread):
                 genres = []
             else:
                 items, has_more, genres = self.client.fetch_catalog(
-                    self.section, self.page, self.genre
+                    self.section, self.page, self.genre, self.year
                 )
             self.done.emit(
                 self.token,
@@ -225,6 +269,7 @@ class CatalogWorker(QThread):
                     "page": self.page,
                     "section": self.section,
                     "genre": self.genre,
+                    "year": self.year,
                     "genres": genres,
                     "error": "",
                 },
@@ -239,6 +284,7 @@ class CatalogWorker(QThread):
                     "page": self.page,
                     "section": self.section,
                     "genre": self.genre,
+                    "year": self.year,
                     "genres": [],
                     "error": str(e),
                 },
@@ -552,6 +598,9 @@ class MpvVideo(QOpenGLWidget):
         self._gl = False
         self._gp = None
         self._mouse_t = 0.0
+        self._paint_begin = 0.0
+        self._paint_in_progress = False
+        self._slow_paint_log = 0.0
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
         self.setMinimumSize(320, 180)
@@ -715,7 +764,14 @@ class MpvVideo(QOpenGLWidget):
         if w <= 0 or h <= 0:
             return
         try:
+            ctx = QOpenGLContext.currentContext()
+            if ctx is None or not ctx.isValid():
+                return
+            self._paint_begin = time.monotonic()
+            self._paint_in_progress = True
+            t0 = time.monotonic()
             r.update()
+            t1 = time.monotonic()
             r.render(
                 opengl_fbo={
                     "w": w,
@@ -726,8 +782,19 @@ class MpvVideo(QOpenGLWidget):
                 flip_y=True,
             )
             r.report_swap()
+            t2 = time.monotonic()
+            total = t2 - t0
+            if total > 0.5 and t2 - self._slow_paint_log > 5.0:
+                self._slow_paint_log = t2
+                _log(
+                    "slow paint: total=", round(total, 3),
+                    "update=", round(t1 - t0, 3),
+                    "render=", round(t2 - t1, 3),
+                )
         except Exception as e:
             _dbg("mpv render:", e)
+        finally:
+            self._paint_in_progress = False
 
     def _cmd(self, *args):
         m = self._mpv
@@ -870,6 +937,22 @@ class Player(QObject):
             target=self._mpvq_loop, name="mpv-cmd", daemon=True
         )
         self._mpvq_thread.start()
+        # Кэш свойств mpv. Читать mpv.time_pos и т.п. из GUI-потока
+        # нельзя: libmpv может заблокироваться на открытии/сети и
+        # заморозить весь интерфейс. Значения обновляются в
+        # MPVEventHandler через observe_property.
+        self.time_pos = None
+        self.playback_time = None
+        self.duration = 0.0
+        self.pause = False
+        self.core_idle = False
+        self.eof_reached = False
+        self.paused_for_cache = False
+        self.cache_pct = None
+        self.fullscreen = False
+        self.volume = 50
+        self.path = ""
+        self.video_params = None
         self._create_mpv()
 
     def _mpvq_loop(self):
@@ -934,6 +1017,7 @@ class Player(QObject):
         self._bind_keys()
         self._observe_fullscreen()
         self._observe_buffering()
+        self._observe_state()
         try:
             self._widget.bind_mpv(self.mpv, self._mpv_module, self.enqueue)
         except Exception as e:
@@ -976,7 +1060,8 @@ class Player(QObject):
         def on_fullscreen(_name, value):
             if value is None:
                 return
-            self.fs_changed.emit(bool(value))
+            self.fullscreen = bool(value)
+            self.fs_changed.emit(self.fullscreen)
 
         try:
             self.mpv.observe_property("fullscreen", on_fullscreen)
@@ -989,6 +1074,7 @@ class Player(QObject):
         def on_core_idle(_name, value):
             if value is None:
                 return
+            self.core_idle = bool(value)
             if value:
                 if (
                     self._has_video
@@ -1007,6 +1093,7 @@ class Player(QObject):
             if value is None:
                 return
             self._paused_for_cache = bool(value)
+            self.paused_for_cache = self._paused_for_cache
             if self._paused_for_cache:
                 pct = self._cache_pct
                 text = "Буферизация…"
@@ -1023,6 +1110,7 @@ class Player(QObject):
                 return
             try:
                 self._cache_pct = float(value)
+                self.cache_pct = self._cache_pct
             except (TypeError, ValueError):
                 return
             if self._paused_for_cache:
@@ -1034,6 +1122,7 @@ class Player(QObject):
             if value:
                 self._loading = False
                 self._has_video = True
+                self.video_params = value
                 self.buffering.emit("")
 
         try:
@@ -1060,6 +1149,9 @@ class Player(QObject):
             _dbg("observe seeking:", e)
 
         def on_eof_reached(_name, value):
+            if value is None:
+                return
+            self.eof_reached = bool(value)
             if (
                 value
                 and not self._failed
@@ -1079,6 +1171,55 @@ class Player(QObject):
             self._has_video = True
             self.buffering.emit("")
 
+    def _observe_state(self):
+        """Кэширует свойства mpv, чтобы GUI не вызывал libmpv напрямую."""
+
+        def as_float(value):
+            try:
+                return None if value is None else float(value)
+            except (TypeError, ValueError):
+                return None
+
+        def on_time_pos(_name, value):
+            self.time_pos = as_float(value)
+
+        def on_playback_time(_name, value):
+            self.playback_time = as_float(value)
+
+        def on_duration(_name, value):
+            if value is None:
+                return
+            self.duration = as_float(value) or 0.0
+
+        def on_pause(_name, value):
+            if value is not None:
+                self.pause = bool(value)
+
+        def on_path(_name, value):
+            self.path = str(value or "")
+
+        def on_volume(_name, value):
+            if value is None:
+                return
+            try:
+                self.volume = int(float(value))
+            except (TypeError, ValueError):
+                pass
+
+        observers = (
+            ("time-pos", on_time_pos),
+            ("playback-time", on_playback_time),
+            ("duration", on_duration),
+            ("pause", on_pause),
+            ("path", on_path),
+            ("volume", on_volume),
+        )
+        for name, callback in observers:
+            try:
+                self.mpv.observe_property(name, callback)
+            except Exception as e:
+                _dbg("observe", name, e)
+
     def in_seek_grace(self) -> bool:
         return self._seeking or time.monotonic() < self._seek_until
 
@@ -1094,6 +1235,14 @@ class Player(QObject):
         self._has_video = False
         self._paused_for_cache = False
         self._cache_pct = None
+        self.paused_for_cache = False
+        self.cache_pct = None
+        self.time_pos = None
+        self.playback_time = None
+        self.duration = 0.0
+        self.pause = False
+        self.core_idle = False
+        self.eof_reached = False
         self._failed = False
         self._stopped = False
         self._pending_start = (self._play_seq, float(start_pos or 0.0))
@@ -1157,8 +1306,10 @@ class Player(QObject):
     def volume(self, delta):
         def _vol():
             try:
-                cur = int(self.mpv.volume or 50)
-                self.mpv.volume = max(0, min(150, cur + delta))
+                cur = int(self.volume or 50)
+                target = max(0, min(150, cur + delta))
+                self.mpv.volume = target
+                self.volume = target
             except Exception as e:
                 _dbg("volume:", e)
 
@@ -1184,8 +1335,9 @@ class Player(QObject):
 
     def _sync_fullscreen(self, value: bool):
         try:
-            if bool(self.mpv.fullscreen) != value:
+            if self.fullscreen != value:
                 self.mpv.fullscreen = value
+                self.fullscreen = value
         except Exception as e:
             _dbg("fullscreen sync:", e)
 
@@ -1320,12 +1472,24 @@ class SettingsDialog(QDialog):
 
         actions = QHBoxLayout()
         self.check_btn = QPushButton("Проверить сайт")
+        self.check_btn.setIcon(themed_icon(
+            self, ("view-refresh", "view-refresh-symbolic"),
+            QStyle.StandardPixmap.SP_BrowserReload,
+        ))
         self.check_btn.setToolTip("Загрузить главную страницу с этими настройками")
         self.check_btn.clicked.connect(self._check_site)
         self.reset_btn = QPushButton("Сбросить сессию")
+        self.reset_btn.setIcon(themed_icon(
+            self, ("edit-clear", "edit-clear-symbolic"),
+            QStyle.StandardPixmap.SP_DialogResetButton,
+        ))
         self.reset_btn.setToolTip("Забыть cookie Anubis и пройти проверку заново")
         self.reset_btn.clicked.connect(self._reset_session)
         self.cache_btn = QPushButton("Очистить кэш")
+        self.cache_btn.setIcon(themed_icon(
+            self, ("user-trash", "user-trash-symbolic"),
+            QStyle.StandardPixmap.SP_TrashIcon,
+        ))
         self.cache_btn.setToolTip("Удалить сохранённый список главной")
         self.cache_btn.clicked.connect(self._clear_cache)
         actions.addWidget(self.check_btn)
@@ -1524,6 +1688,22 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self, mpv_module):
         super().__init__()
+        # Сторожевой таймер запускаем как можно раньше: он должен
+        # поймать зависание и во время инициализации, и при просмотре.
+        self._watch_stop = threading.Event()
+        self._ui_beat = time.monotonic()
+        self._last_hang_dump = 0.0
+        self._beat_timer = QTimer(self)
+        self._beat_timer.setInterval(1000)
+        self._beat_timer.timeout.connect(self._ui_heartbeat)
+        self._beat_timer.start()
+        self._watch_thread = threading.Thread(
+            target=self._hang_watchdog,
+            name="ui-watchdog",
+            daemon=True,
+        )
+        self._watch_thread.start()
+
         self.mpv_module = mpv_module
         self.setWindowTitle(APP_TITLE)
         self.resize(1320, 800)
@@ -1540,6 +1720,7 @@ class MainWindow(QMainWindow):
         self.catalog_items: List[core.SearchItem] = []
         self._catalog_section = "home"
         self._catalog_genre = ""
+        self._catalog_year = ""
         self._catalog_page = 1
         self._has_more = False
         self._search_active = False
@@ -1574,6 +1755,7 @@ class MainWindow(QMainWindow):
         self._playing_eid = ""
         self._finish_latched = False
         self._near_end_count = 0
+        self._pause_guard_until = 0.0
         self._stream_loading = False
         self._pending_selection = ("", "1", "1")
         self._startup_resume_url = ""
@@ -1631,6 +1813,10 @@ class MainWindow(QMainWindow):
         self.player.resumed.connect(self._on_resumed)
         self.player.finished.connect(self._on_finished)
         self.player.playback_idle.connect(self._on_playback_idle)
+        self._dump_shortcut = QShortcut(
+            QKeySequence("Ctrl+Shift+D"), self
+        )
+        self._dump_shortcut.activated.connect(self._manual_dump)
         if self.player.mpv is None:
             QTimer.singleShot(
                 0,
@@ -1856,29 +2042,61 @@ class MainWindow(QMainWindow):
         )
         self.genre_combo.setEnabled(False)
 
+        self.year_combo = QComboBox()
+        self.year_combo.addItem("Все годы", "")
+        current_year = datetime.now().year + 1
+        for year in range(current_year, 1889, -1):
+            self.year_combo.addItem(str(year), str(year))
+        self.year_combo.setMinimumWidth(100)
+        self.year_combo.setToolTip(
+            "Фильтр по году выпуска. На сайте это подборки «Лучшее» "
+            "за год; для «Новинок» и «ТВ-шоу» недоступен."
+        )
+        self.year_combo.setEnabled(False)
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("Поиск фильма или сериала…")
         self.search.setClearButtonEnabled(True)
         self.search.setToolTip("Поиск по названию (Ctrl+F)")
 
         self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.setIcon(themed_icon(
+            self, ("view-refresh", "view-refresh-symbolic"),
+            QStyle.StandardPixmap.SP_BrowserReload,
+        ))
         self.refresh_btn.setToolTip("Обновить текущий список (Ctrl+R)")
         self.refresh_btn.clicked.connect(self.refresh_clicked)
 
-        self.more_btn = QPushButton("Ещё…")
+        self.more_btn = QPushButton("Показать ещё…")
+        self.more_btn.setIcon(themed_icon(
+            self, ("go-down", "go-down-symbolic", "view-more"),
+            QStyle.StandardPixmap.SP_ArrowDown,
+        ))
         self.more_btn.setToolTip("Загрузить следующую страницу каталога")
         self.more_btn.setEnabled(False)
         self.more_btn.clicked.connect(self.load_more)
 
         self.list_btn = QPushButton("Скрыть список")
+        self.list_btn.setIcon(themed_icon(
+            self, ("view-list", "view-list-symbolic"),
+            QStyle.StandardPixmap.SP_FileDialogListView,
+        ))
         self.list_btn.setToolTip("Показать/скрыть список (Ctrl+L)")
         self.list_btn.clicked.connect(self.toggle_list)
 
         self.info_btn = QPushButton("Скрыть инфо")
+        self.info_btn.setIcon(themed_icon(
+            self, ("dialog-information", "dialog-information-symbolic"),
+            QStyle.StandardPixmap.SP_FileDialogInfoView,
+        ))
         self.info_btn.setToolTip("Показать/скрыть панель информации (Ctrl+I)")
         self.info_btn.clicked.connect(self.toggle_info)
 
         self.fs_btn = QPushButton("На весь экран")
+        self.fs_btn.setIcon(themed_icon(
+            self, ("view-fullscreen", "view-fullscreen-symbolic"),
+            QStyle.StandardPixmap.SP_TitleBarMaxButton,
+        ))
         self.fs_btn.setToolTip(
             "Полный экран (F11; в окне видео — F, Esc — выйти)"
         )
@@ -1889,11 +2107,11 @@ class MainWindow(QMainWindow):
         self.settings_btn.setToolTip("Настройки: зеркало, прокси, качество (Ctrl+,)")
         self.settings_btn.clicked.connect(self.open_settings)
 
+        row.addWidget(self.refresh_btn)
         row.addWidget(self.catalog_combo)
         row.addWidget(self.genre_combo)
+        row.addWidget(self.year_combo)
         row.addWidget(self.search, 1)
-        row.addWidget(self.refresh_btn)
-        row.addWidget(self.more_btn)
         row.addWidget(self.list_btn)
         row.addWidget(self.info_btn)
         row.addWidget(self.fs_btn)
@@ -1914,7 +2132,20 @@ class MainWindow(QMainWindow):
         self.list.setStyleSheet("QTreeWidget::item { padding: 4px; }")
         self.list.itemSelectionChanged.connect(self._on_selection_changed)
         self.list.itemDoubleClicked.connect(self._on_item_double_click)
-        self.splitter.addWidget(self.list)
+
+        self.list_box = QWidget()
+        list_layout = QVBoxLayout(self.list_box)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(4)
+        list_layout.addWidget(self.list, 1)
+        bottom_row = QHBoxLayout()
+        bottom_row.setContentsMargins(0, 0, 0, 0)
+        bottom_row.setSpacing(4)
+        bottom_row.addWidget(self.more_btn, 1)
+        self.more_btn.setVisible(False)
+        list_layout.addLayout(bottom_row)
+        self.list_box.setMinimumWidth(280)
+        self.splitter.addWidget(self.list_box)
 
         self.video = MpvVideo()
         self.video_overlay = VideoOverlay(self.video)
@@ -2023,7 +2254,11 @@ class MainWindow(QMainWindow):
         info.addLayout(form)
 
         btns = QHBoxLayout()
-        self.play_btn = QPushButton("▶ Смотреть")
+        self.play_btn = QPushButton("Смотреть")
+        self.play_btn.setIcon(themed_icon(
+            self, ("media-playback-start", "media-playback-start-symbolic"),
+            QStyle.StandardPixmap.SP_MediaPlay,
+        ))
         self.play_btn.setEnabled(False)
         self.play_btn.setStyleSheet(
             "QPushButton { background:#2a9d8f; color:white; "
@@ -2032,6 +2267,10 @@ class MainWindow(QMainWindow):
         )
         self.play_btn.clicked.connect(self._play_current)
         self.copy_btn = QPushButton("Копировать ссылку")
+        self.copy_btn.setIcon(themed_icon(
+            self, ("edit-copy", "edit-copy-symbolic"),
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+        ))
         self.copy_btn.setEnabled(False)
         self.copy_btn.clicked.connect(self._copy_link)
         btns.addWidget(self.play_btn, 1)
@@ -2071,6 +2310,9 @@ class MainWindow(QMainWindow):
         )
         self.genre_combo.currentIndexChanged.connect(
             self._on_genre_changed
+        )
+        self.year_combo.currentIndexChanged.connect(
+            self._on_year_changed
         )
         self.translation_combo.currentIndexChanged.connect(
             self._on_translation_changed
@@ -2232,18 +2474,10 @@ class MainWindow(QMainWindow):
     def _mpv_time_pos(self):
         if self.player.mpv is None:
             return None
-        for name in ("time_pos", "playback_time"):
-            try:
-                value = getattr(self.player.mpv, name)
-            except Exception:
-                continue
-            if value is None:
-                continue
-            try:
-                return float(value)
-            except (TypeError, ValueError):
-                continue
-        return None
+        pos = self.player.time_pos
+        if pos is None:
+            pos = self.player.playback_time
+        return pos
 
     def _read_mpv_position(self):
         if self.player.mpv is None:
@@ -2251,17 +2485,12 @@ class MainWindow(QMainWindow):
             return None
         pos = self._mpv_time_pos()
         if pos is None:
-            try:
-                dur = self.player.mpv.duration
-            except Exception:
-                dur = None
-            _log("position: time_pos is None, duration", repr(dur))
+            _log(
+                "position: time_pos is None, duration",
+                repr(self.player.duration),
+            )
             return None
-        try:
-            dur = float(self.player.mpv.duration or 0)
-        except Exception:
-            dur = 0.0
-        return pos, dur
+        return pos, float(self.player.duration or 0.0)
 
     def save_position(self):
         key = self._playing_key
@@ -2329,14 +2558,48 @@ class MainWindow(QMainWindow):
     def _confirm_idle_finish(self):
         if self._closing or not self._playing_key or self._finish_latched:
             return
-        try:
-            failed = self.player._failed
-            stopped = self.player._stopped
-        except Exception:
-            failed = stopped = False
-        if failed or stopped:
+        player = self.player
+        if player._failed or player._stopped:
             return
-        _log("idle -> finish")
+        if player._loading:
+            _log("idle ignored: still loading")
+            return
+        if player.pause:
+            _log("idle ignored: paused")
+            return
+        if player.paused_for_cache:
+            _log("idle ignored: buffering")
+            return
+        if player.in_seek_grace():
+            _log("idle ignored: seek grace")
+            return
+        if time.monotonic() < getattr(self, "_pause_guard_until", 0.0):
+            _log("idle ignored: pause guard")
+            return
+        pos = player.time_pos
+        dur = player.duration
+        if player.eof_reached:
+            if pos is None or not dur or pos >= dur - 2.0:
+                _log("idle -> finish (eof)")
+                self._on_finished()
+            else:
+                _log(
+                    "idle ignored: eof flag but pos",
+                    round(pos, 1), "of", round(dur, 1),
+                )
+            return
+        # core-idle может срабатывать при паузе/открытии потока.
+        # Завершением считаем только реальный конец файла.
+        if pos is None or not dur or dur < 30.0:
+            _log("idle ignored: no reliable position", pos, dur)
+            return
+        if pos < dur - 1.5:
+            _log(
+                "idle ignored: not at end",
+                round(pos, 1), "of", round(dur, 1),
+            )
+            return
+        _log("idle -> finish (near end)")
         self._on_finished()
 
     def _update_playback_info(self):
@@ -2362,18 +2625,9 @@ class MainWindow(QMainWindow):
         if pos is None:
             _log("info: time_pos is None")
             return
-        try:
-            dur = float(self.player.mpv.duration or 0)
-        except (TypeError, ValueError):
-            dur = 0.0
-        try:
-            paused = bool(self.player.mpv.pause)
-        except Exception:
-            paused = False
-        try:
-            pfc = bool(self.player.mpv.paused_for_cache)
-        except Exception:
-            pfc = False
+        dur = float(self.player.duration or 0.0)
+        paused = bool(self.player.pause)
+        pfc = bool(self.player.paused_for_cache)
 
         # Страховка, если mpv не прислал end-file: конец определяем
         # по времени. Требуем два подряд замера у конца, чтобы случайная
@@ -2415,6 +2669,20 @@ class MainWindow(QMainWindow):
         if self._next_timer.isActive():
             text += f" · следующая через {self._next_remaining} с"
         self.playback_label.setText(text)
+
+        now = time.monotonic()
+        if now - getattr(self, "_last_state_log", 0.0) >= 5.0:
+            self._last_state_log = now
+            _log(
+                "state:",
+                "pos=", round(pos, 2),
+                "dur=", round(dur, 1),
+                "paused=", paused,
+                "for_cache=", pfc,
+                "idle=", self.player.core_idle,
+                "eof=", self.player.eof_reached,
+                "cache=", self.player.cache_pct,
+            )
 
     def _on_resumed(self, pos: float):
         _log("resumed at", pos)
@@ -2665,6 +2933,10 @@ class MainWindow(QMainWindow):
             return
         section = str(self.catalog_combo.currentData() or "home")
         genre = self._catalog_genre if section != "home" else ""
+        year = (
+            self._catalog_year
+            if section not in ("home", "show") else ""
+        )
         page = 1 if reset else self._catalog_page + 1
         self._catalog_token += 1
         token = self._catalog_token
@@ -2674,7 +2946,7 @@ class MainWindow(QMainWindow):
             "Загрузка каталога…" if reset else f"Загрузка страницы {page}…"
         )
         worker = CatalogWorker(
-            self.client, section, page, genre, token, self
+            self.client, section, page, genre, year, token, self
         )
         self._catalog_worker = worker
         self._track_worker(worker)
@@ -2688,6 +2960,8 @@ class MainWindow(QMainWindow):
         self._catalog_worker = None
         err = (result or {}).get("error") or ""
         if err:
+            self.more_btn.setEnabled(self._has_more)
+            self.more_btn.setVisible(self._has_more)
             self.statusBar().showMessage("Не удалось загрузить каталог: " + err)
             if not self.catalog_items:
                 QMessageBox.critical(
@@ -2701,10 +2975,13 @@ class MainWindow(QMainWindow):
         page = int((result or {}).get("page") or 1)
         section = str((result or {}).get("section") or "home")
         genre = str((result or {}).get("genre") or "")
+        year = str((result or {}).get("year") or "")
         genres = (result or {}).get("genres") or []
         if page <= 1:
             self._catalog_genre = genre
+            self._catalog_year = year
             self._update_genres(genres, section)
+            self._update_year_enabled(section)
 
         if page <= 1:
             new_items = list(items)
@@ -2720,12 +2997,15 @@ class MainWindow(QMainWindow):
         if self.search.text().strip():
             self.catalog_items = new_items
             self.genre_combo.setEnabled(False)
+            self.year_combo.setEnabled(False)
+            self.more_btn.setVisible(False)
             if section == "home" and page == 1:
                 self._save_cache()
             return
 
         self.catalog_items = new_items
         self.more_btn.setEnabled(self._has_more)
+        self.more_btn.setVisible(self._has_more)
         self._populate_list(self.catalog_items)
         if section == "home" and page == 1:
             self._save_cache()
@@ -2771,6 +3051,27 @@ class MainWindow(QMainWindow):
         self.catalog_items = []
         self.refresh_catalog(reset=True)
 
+    def _update_year_enabled(self, section: str):
+        enabled = (
+            section not in ("home", "show")
+            and not self.search.text().strip()
+        )
+        self._suppress_ui = True
+        self.year_combo.setEnabled(enabled)
+        if not enabled and self.year_combo.currentIndex() != 0:
+            self.year_combo.setCurrentIndex(0)
+            self._catalog_year = ""
+        self._suppress_ui = False
+
+    def _on_year_changed(self):
+        if self._suppress_ui:
+            return
+        self._catalog_year = str(self.year_combo.currentData() or "")
+        self._catalog_page = 1
+        self._has_more = False
+        self.catalog_items = []
+        self.refresh_catalog(reset=True)
+
     def load_more(self):
         if not self._has_more:
             return
@@ -2788,6 +3089,7 @@ class MainWindow(QMainWindow):
         self._search_active = False
         self._search_token += 1          # отменяем возможный старый поиск
         self._catalog_genre = ""
+        self._catalog_year = ""
         self._catalog_page = 1
         self._has_more = False
         self.catalog_items = []
@@ -2795,6 +3097,8 @@ class MainWindow(QMainWindow):
         self.genre_combo.clear()
         self.genre_combo.addItem("Все жанры", "")
         self.genre_combo.setEnabled(False)
+        self.year_combo.setCurrentIndex(0)
+        self.year_combo.setEnabled(False)
         self._suppress_ui = False
         self.refresh_catalog(reset=True)
 
@@ -2806,12 +3110,16 @@ class MainWindow(QMainWindow):
             self._search_active = False
             self._populate_list(self.catalog_items)
             self.more_btn.setEnabled(self._has_more)
+            self.more_btn.setVisible(self._has_more)
             section = str(self.catalog_combo.currentData() or "home")
             self.genre_combo.setEnabled(
                 section != "home" and self.genre_combo.count() > 1
             )
+            self._update_year_enabled(section)
             return
         self.genre_combo.setEnabled(False)
+        self.year_combo.setEnabled(False)
+        self.more_btn.setVisible(False)
         self._search_timer.start()
 
     def _run_search(self):
@@ -2822,6 +3130,7 @@ class MainWindow(QMainWindow):
         token = self._search_token
         self._search_active = True
         self.more_btn.setEnabled(False)
+        self.more_btn.setVisible(False)
         self.refresh_btn.setEnabled(False)
         self.statusBar().showMessage(f"Поиск: {query}…")
         worker = SearchWorker(self.client, query, token, self)
@@ -2843,6 +3152,8 @@ class MainWindow(QMainWindow):
         query = (result or {}).get("query") or ""
         self._populate_list(items, select_url="")
         self.genre_combo.setEnabled(False)
+        self.year_combo.setEnabled(False)
+        self.more_btn.setVisible(False)
         if items:
             self.statusBar().showMessage(
                 f"Найдено: {len(items)} · {query}", 6000
@@ -3477,6 +3788,7 @@ class MainWindow(QMainWindow):
         self.screen_inhibitor.acquire_async()
         self._finish_latched = False
         self._near_end_count = 0
+        self._pause_guard_until = 0.0
         self._playing_post_id = info.post_id if info is not None else ""
         self._playing_title = title
         self._playing_tid = tid
@@ -3678,7 +3990,7 @@ class MainWindow(QMainWindow):
         if self._last_stream is None or self._title_info is None:
             return
         try:
-            path = str(self.player.mpv.path or "") if self.player.mpv else ""
+            path = self.player.path if self.player.mpv else ""
         except Exception:
             path = ""
         if path:
@@ -3704,6 +4016,7 @@ class MainWindow(QMainWindow):
 
     def _on_mpv_key(self, action: str):
         if action == "pause":
+            self._pause_guard_until = time.monotonic() + 2.0
             self.player.toggle_pause()
         elif action == "fullscreen":
             self.toggle_fullscreen()
@@ -3792,7 +4105,7 @@ class MainWindow(QMainWindow):
     def toggle_list(self):
         self._list_visible = not self._list_visible
         if not self.isFullScreen():
-            self.list.setVisible(self._list_visible)
+            self.list_box.setVisible(self._list_visible)
         self.list_btn.setText(
             "Скрыть список" if self._list_visible else "Показать список"
         )
@@ -3820,7 +4133,7 @@ class MainWindow(QMainWindow):
             return
         self._was_maximized = self.isMaximized()
         self.controls.hide()
-        self.list.hide()
+        self.list_box.hide()
         self.info_panel.hide()
         self.statusBar().hide()
         self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
@@ -3833,7 +4146,7 @@ class MainWindow(QMainWindow):
         if not self.isFullScreen():
             return
         self.controls.show()
-        self.list.setVisible(self._list_visible)
+        self.list_box.setVisible(self._list_visible)
         self.info_panel.setVisible(self._info_visible)
         self.statusBar().show()
         self.centralWidget().layout().setContentsMargins(9, 9, 9, 9)
@@ -3918,16 +4231,110 @@ class MainWindow(QMainWindow):
         elif old_source != new_source:
             if self._last_stream is not None and self._title_info is not None:
                 try:
-                    path = (
-                        str(self.player.mpv.path or "")
-                        if self.player.mpv else ""
-                    )
+                    path = self.player.path if self.player.mpv else ""
                 except Exception:
                     path = ""
                 if path:
                     QTimer.singleShot(50, self._play_current)
 
     # ---------- потоки ----------
+    def _ui_heartbeat(self):
+        self._ui_beat = time.monotonic()
+
+    def _hang_watchdog(self):
+        while not self._watch_stop.wait(2.0):
+            now = time.monotonic()
+            ui_idle = now - self._ui_beat
+            video = getattr(self, "video", None)
+            paint = bool(
+                video and getattr(video, "_paint_in_progress", False)
+            )
+            paint_for = 0.0
+            if paint:
+                paint_for = now - getattr(video, "_paint_begin", now)
+            if ui_idle < 8.0 and paint_for < 8.0:
+                continue
+            if now - self._last_hang_dump < 30.0:
+                continue
+            self._last_hang_dump = now
+            self._dump_hang(ui_idle, paint_for)
+
+    def _manual_dump(self):
+        video = getattr(self, "video", None)
+        paint = bool(
+            video and getattr(video, "_paint_in_progress", False)
+        )
+        paint_for = 0.0
+        if paint:
+            paint_for = max(
+                0.0,
+                time.monotonic() - getattr(video, "_paint_begin", 0.0),
+            )
+        self._dump_hang(
+            max(0.0, time.monotonic() - self._ui_beat), paint_for
+        )
+        self.statusBar().showMessage(
+            "Дамп записан: ~/.cache/hdrezka-gui/hang.log", 6000
+        )
+
+    def _dump_hang(self, ui_idle: float, paint_for: float):
+        path = os.path.join(
+            os.path.expanduser("~/.cache/hdrezka-gui"), "hang.log"
+        )
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            try:
+                if os.path.getsize(path) > 1_000_000:
+                    with open(path, "w", encoding="utf-8"):
+                        pass
+            except OSError:
+                pass
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(
+                    "\n===== %s =====\n"
+                    % datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                )
+                fh.write(
+                    "ui_idle=%.1f paint_in_progress=%.0f paint_for=%.1f\n"
+                    % (
+                        ui_idle,
+                        1 if paint_for else 0,
+                        paint_for,
+                    )
+                )
+                fh.write(
+                    "backend=%s playing=%s label=%s\n"
+                    % (
+                        getattr(
+                            getattr(self, "screen_inhibitor", None),
+                            "backend", "?",
+                        ),
+                        getattr(self, "_playing_key", ""),
+                        getattr(self, "_playing_label", ""),
+                    )
+                )
+                player = getattr(self, "player", None)
+                if player is not None:
+                    fh.write(
+                        "pos=%s dur=%s paused=%s for_cache=%s "
+                        "idle=%s eof=%s\n"
+                        % (
+                            getattr(player, "time_pos", None),
+                            getattr(player, "duration", None),
+                            getattr(player, "pause", None),
+                            getattr(player, "paused_for_cache", None),
+                            getattr(player, "core_idle", None),
+                            getattr(player, "eof_reached", None),
+                        )
+                    )
+                fh.flush()
+                faulthandler.dump_traceback(file=fh, all_threads=True)
+                fh.flush()
+        except Exception as e:
+            _log("hang dump error:", e)
+            return
+        _log("hang dump:", path)
+
     def _track_worker(self, worker: QThread):
         self._workers.add(worker)
         worker.finished.connect(
@@ -3945,6 +4352,8 @@ class MainWindow(QMainWindow):
         self._pos_timer.stop()
         self._next_timer.stop()
         self._info_timer.stop()
+        self._beat_timer.stop()
+        self._watch_stop.set()
         self.player.set_cursor_autohide(False)
         self.next_overlay.hide()
         self.save_position()
@@ -3998,6 +4407,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     app.setApplicationDisplayName(APP_TITLE)
+    setup_faulthandler()
     try:
         locale.setlocale(locale.LC_NUMERIC, "C")
     except locale.Error:
