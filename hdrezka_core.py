@@ -151,6 +151,7 @@ class TitleInfo:
     default_season: str = "1"
     default_episode: str = "1"
     premium: bool = False
+    coming_soon: bool = False
 
 
 @dataclass
@@ -654,6 +655,12 @@ def parse_title_html(text: str, url: str, base: str) -> TitleInfo:
     if default_tid and default_tid not in {t.id for t in translators}:
         translators.insert(0, Translator(id=default_tid, name="По умолчанию"))
 
+    low = (text or "").lower()
+    coming_soon = (
+        "скоро онлайн" in low
+        or "анонсы и трейлеры" in low
+    )
+
     return TitleInfo(
         post_id=post_id,
         url=url,
@@ -676,6 +683,7 @@ def parse_title_html(text: str, url: str, base: str) -> TitleInfo:
         default_translator=default_tid,
         default_season=default_season,
         default_episode=default_episode,
+        coming_soon=coming_soon,
     )
 
 

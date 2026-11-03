@@ -375,15 +375,21 @@ class EpisodesWorker(QThread):
 class StreamWorker(QThread):
     done = pyqtSignal(int, object)
 
+    MAX_TRIES = 4
+
     def __init__(
-        self, client, post_id: str, translator_id: str, season: str,
+        self, client, post_id: str, translator_ids, season: str,
         episode: str, is_series: bool, quality: str, referer: str,
         token: int, parent=None,
     ):
         super().__init__(parent)
         self.client = client
         self.post_id = post_id
-        self.translator_id = translator_id
+        if isinstance(translator_ids, str):
+            translator_ids = [translator_ids]
+        self.translator_ids = [
+            str(t) for t in (translator_ids or []) if str(t)
+        ]
         self.season = season
         self.episode = episode
         self.is_series = is_series
@@ -392,25 +398,41 @@ class StreamWorker(QThread):
         self.token = token
 
     def run(self):
-        try:
-            info = self.client.fetch_stream(
-                self.post_id,
-                self.translator_id,
-                self.season,
-                self.episode,
-                self.is_series,
-                self.referer,
-            )
-            chosen = core.choose_quality(info.qualities, self.quality)
-            if chosen is None:
-                raise core.HDrezkaError("нет доступных качеств")
-            self.done.emit(
-                self.token,
-                {"stream": info, "chosen": chosen, "error": ""},
-            )
-        except Exception as e:
-            traceback.print_exc()
-            self.done.emit(self.token, {"error": str(e)})
+        last_error = "нет доступных переводов"
+        tried = set()
+        for tid in self.translator_ids[: self.MAX_TRIES]:
+            if tid in tried:
+                continue
+            tried.add(tid)
+            try:
+                info = self.client.fetch_stream(
+                    self.post_id,
+                    tid,
+                    self.season,
+                    self.episode,
+                    self.is_series,
+                    self.referer,
+                )
+                chosen = core.choose_quality(info.qualities, self.quality)
+                if chosen is None:
+                    raise core.HDrezkaError("нет доступных качеств")
+                self.done.emit(
+                    self.token,
+                    {
+                        "stream": info,
+                        "chosen": chosen,
+                        "translator_id": tid,
+                        "error": "",
+                    },
+                )
+                return
+            except Exception as e:
+                last_error = str(e)
+                _log("translation try failed:", tid, last_error)
+        self.done.emit(
+            self.token,
+            {"error": last_error, "translator_id": ""},
+        )
 
 
 class CheckWorker(QThread):
@@ -3455,11 +3477,15 @@ class MainWindow(QMainWindow):
             self.episode_combo.clear()
         self._suppress_ui = False
 
-        self.play_btn.setEnabled(True)
+        self.play_btn.setEnabled(not info.coming_soon)
         note = ""
         if pro_only:
             note = " · только PRO-переводы (нужен аккаунт с подпиской)"
-        if not self._playing_key:
+        if info.coming_soon:
+            self.stream_status.setText(
+                "Видео ещё не добавлено — фильм только анонсирован"
+            )
+        elif not self._playing_key:
             self.stream_status.setText(
                 f"{info.kind} · {info.year}"
                 + (" · PRO-контент" if info.premium else "")
@@ -3659,6 +3685,11 @@ class MainWindow(QMainWindow):
             return
         _log("play_current:", self._selection(info))
         self._autoplay_last_pending = False
+        if info.coming_soon:
+            self.stream_status.setText(
+                "Видео ещё не добавлено — фильм только анонсирован"
+            )
+            return
         if self.player.mpv is None:
             QMessageBox.warning(
                 self, "mpv",
@@ -3671,7 +3702,9 @@ class MainWindow(QMainWindow):
         if not tid:
             tid = info.default_translator
         if not tid:
-            self.stream_status.setText("Не выбран перевод")
+            self.stream_status.setText(
+                "Нет доступных переводов — видео пока не добавлено"
+            )
             return
 
         if info.is_series:
@@ -3697,8 +3730,16 @@ class MainWindow(QMainWindow):
         self.stream_status.setText("Получение ссылки на поток…")
         self.statusBar().showMessage("Получение ссылки…")
         quality = str(self.quality_combo.currentData() or "auto")
+        tids = [tid]
+        if not info.is_series:
+            # Для фильма можно попробовать другие доступные переводы,
+            # если в выбранном ссылка недоступна.
+            for i in range(self.translation_combo.count()):
+                value = str(self.translation_combo.itemData(i) or "")
+                if value and value not in tids:
+                    tids.append(value)
         worker = StreamWorker(
-            self.client, info.post_id, tid, sid, eid, info.is_series,
+            self.client, info.post_id, tids, sid, eid, info.is_series,
             quality, info.url, token, self,
         )
         self._track_worker(worker)
@@ -3739,6 +3780,26 @@ class MainWindow(QMainWindow):
         chosen: core.Quality = (result or {}).get("chosen")
         if stream is None or chosen is None:
             return
+        used_tid = str((result or {}).get("translator_id") or "")
+        if used_tid:
+            idx = self.translation_combo.findData(used_tid)
+            if idx >= 0 and used_tid != str(
+                self.translation_combo.currentData() or ""
+            ):
+                self._suppress_ui = True
+                self.translation_combo.setCurrentIndex(idx)
+                self._suppress_ui = False
+                self.statusBar().showMessage(
+                    "Поток найден в другом переводе: "
+                    + self.translation_combo.currentText(),
+                    8000,
+                )
+            if self._title_info is not None and self._title_info.is_series:
+                sid = str(self.season_combo.currentData() or "1")
+                eid = str(self.episode_combo.currentData() or "1")
+            else:
+                sid, eid = "1", "1"
+            self._pending_selection = (used_tid, sid, eid)
         self._last_stream = stream
         self._start_playback(stream, chosen)
 
