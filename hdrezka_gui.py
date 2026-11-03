@@ -28,6 +28,7 @@ import json
 import locale
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -49,7 +50,8 @@ try:
         pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QBrush, QColor, QKeySequence, QOpenGLContext, QPixmap, QShortcut,
+        QBrush, QColor, QCursor, QKeySequence, QOpenGLContext, QPixmap,
+        QShortcut,
     )
     from PyQt6.QtNetwork import QNetworkAccessManager, QNetworkRequest
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
@@ -64,6 +66,7 @@ except ImportError:  # pragma: no cover
     sys.exit("Не найден PyQt6. Установите: python3 -m pip install PyQt6")
 
 import hdrezka_core as core
+from screen_inhibitor import ScreenInhibitor
 
 # --------------------------------------------------------------------------
 # Константы и настройки
@@ -521,6 +524,11 @@ class MpvVideo(QOpenGLWidget):
         )
         self.overlay = None
         self.next_overlay = None
+        self._cursor_autohide = False
+        self._cursor_timer = QTimer(self)
+        self._cursor_timer.setSingleShot(True)
+        self._cursor_timer.setInterval(2500)
+        self._cursor_timer.timeout.connect(self._hide_cursor_if_idle)
         self.update_wanted.connect(
             self.update, Qt.ConnectionType.QueuedConnection
         )
@@ -531,6 +539,45 @@ class MpvVideo(QOpenGLWidget):
             self.overlay.center()
         if self.next_overlay is not None:
             self.next_overlay.center()
+
+    def set_cursor_autohide(self, enabled: bool):
+        self._cursor_autohide = bool(enabled)
+        if self._cursor_autohide:
+            self._cursor_timer.start()
+        else:
+            self._cursor_timer.stop()
+            self.unsetCursor()
+
+    def _cursor_inside(self) -> bool:
+        try:
+            return self.rect().contains(
+                self.mapFromGlobal(QCursor.pos())
+            )
+        except Exception:
+            return False
+
+    def _hide_cursor_if_idle(self):
+        if (
+            self._cursor_autohide
+            and self.isVisible()
+            and self._cursor_inside()
+        ):
+            self.setCursor(Qt.CursorShape.BlankCursor)
+
+    def _show_cursor(self):
+        if self.cursor().shape() == Qt.CursorShape.BlankCursor:
+            self.unsetCursor()
+        if self._cursor_autohide:
+            self._cursor_timer.start()
+
+    def enterEvent(self, event):
+        self._show_cursor()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._cursor_timer.stop()
+        self.unsetCursor()
+        super().leaveEvent(event)
 
     def bind_mpv(self, mpv_inst, mpv_mod, enqueue=None):
         self._mpv = mpv_inst
@@ -686,6 +733,7 @@ class MpvVideo(QOpenGLWidget):
             super().keyPressEvent(event)
 
     def mouseMoveEvent(self, event):
+        self._show_cursor()
         now = time.monotonic()
         if now - self._mouse_t < 0.04:
             return
@@ -695,6 +743,7 @@ class MpvVideo(QOpenGLWidget):
         event.accept()
 
     def mousePressEvent(self, event):
+        self._show_cursor()
         name = self._MBTN.get(event.button())
         if name is None:
             super().mousePressEvent(event)
@@ -705,6 +754,7 @@ class MpvVideo(QOpenGLWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event):
+        self._show_cursor()
         name = self._MBTN.get(event.button())
         if name is None:
             super().mouseReleaseEvent(event)
@@ -715,6 +765,7 @@ class MpvVideo(QOpenGLWidget):
         event.accept()
 
     def mouseDoubleClickEvent(self, event):
+        self._show_cursor()
         if event.button() == Qt.MouseButton.LeftButton:
             x, y = self._xy(event)
             self._cmd("mouse", x, y, "0", "double")
@@ -723,6 +774,7 @@ class MpvVideo(QOpenGLWidget):
             super().mouseDoubleClickEvent(event)
 
     def wheelEvent(self, event):
+        self._show_cursor()
         delta = event.angleDelta().y()
         if delta:
             self._cmd(
@@ -1088,6 +1140,12 @@ class Player(QObject):
     def set_fullscreen(self, value: bool):
         self.enqueue(lambda: self._sync_fullscreen(bool(value)))
 
+    def set_cursor_autohide(self, enabled: bool):
+        try:
+            self._widget.set_cursor_autohide(bool(enabled))
+        except Exception as e:
+            _dbg("cursor autohide:", e)
+
     def _sync_fullscreen(self, value: bool):
         try:
             if bool(self.mpv.fullscreen) != value:
@@ -1197,6 +1255,13 @@ class SettingsDialog(QDialog):
             "тайтл, восстановить перевод/серию и сразу продолжить "
             "с сохранённого места."
         )
+        self.hide_cursor_check = QCheckBox(
+            "Скрывать курсор в полноэкранном режиме"
+        )
+        self.hide_cursor_check.setToolTip(
+            "Курсор автоматически исчезает через пару секунд без "
+            "движения мыши и появляется снова при движении."
+        )
 
         grid.addWidget(self.base_label, 0, 0)
         grid.addWidget(self.base_edit, 0, 1, 1, 2)
@@ -1212,6 +1277,7 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.next_timer_label, 6, 0)
         grid.addWidget(self.next_timer_spin, 6, 1)
         grid.addWidget(self.autoplay_last_check, 7, 0, 1, 2)
+        grid.addWidget(self.hide_cursor_check, 8, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
 
@@ -1288,6 +1354,9 @@ class SettingsDialog(QDialog):
         self.autoplay_last_check.setChecked(
             s.value("autoplay_last", True, type=bool)
         )
+        self.hide_cursor_check.setChecked(
+            s.value("hide_cursor_fs", True, type=bool)
+        )
         self._sync_enabled()
 
     def _save(self):
@@ -1304,6 +1373,9 @@ class SettingsDialog(QDialog):
         s.setValue("next_timer", self.next_timer_spin.value())
         s.setValue(
             "autoplay_last", self.autoplay_last_check.isChecked()
+        )
+        s.setValue(
+            "hide_cursor_fs", self.hide_cursor_check.isChecked()
         )
         s.sync()
 
@@ -1423,6 +1495,7 @@ class MainWindow(QMainWindow):
 
         self.settings = QSettings(ORG_NAME, APP_NAME)
         self.client = self._new_client()
+        self.screen_inhibitor = ScreenInhibitor()
 
         self.catalog_items: List[core.SearchItem] = []
         self._catalog_section = "home"
@@ -1461,6 +1534,7 @@ class MainWindow(QMainWindow):
         self._playing_eid = ""
         self._finish_latched = False
         self._near_end_count = 0
+        self._stream_loading = False
         self._pending_selection = ("", "1", "1")
         self._startup_resume_url = ""
         self._autoplay_last_pending = False
@@ -2156,6 +2230,8 @@ class MainWindow(QMainWindow):
         self._playing_key = ""
         self.playback_label.setText("Остановлено")
         self._maybe_autoplay_next()
+        if not self._next_timer.isActive() and not self._stream_loading:
+            self.screen_inhibitor.release()
 
     def _on_playback_idle(self):
         if self._closing or not self._playing_key or self._finish_latched:
@@ -2462,6 +2538,8 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._next_episode = None
+        if not self._playing_key and not self._stream_loading:
+            self.screen_inhibitor.release()
         if active and not quiet:
             self.stream_status.setText(
                 "Автозапуск следующей серии отменён"
@@ -3206,6 +3284,8 @@ class MainWindow(QMainWindow):
         else:
             sid, eid = "1", "1"
 
+        self._stream_loading = True
+        self.screen_inhibitor.acquire()
         self._cancel_next_timer(quiet=True)
         self._startup_timer.stop()
         self._resume_timer.stop()
@@ -3229,9 +3309,11 @@ class MainWindow(QMainWindow):
     def _on_stream_done(self, token: int, result: dict):
         if token != self._stream_token:
             return
+        self._stream_loading = False
         self.play_btn.setEnabled(True)
         err = (result or {}).get("error") or ""
         if err:
+            self.screen_inhibitor.release()
             self._startup_timer.stop()
             self._hide_overlay()
             self.stream_status.setText("Ошибка: " + err)
@@ -3304,6 +3386,7 @@ class MainWindow(QMainWindow):
             if info is not None and tid else ""
         )
         self._playing_key = key
+        self.screen_inhibitor.acquire()
         self._finish_latched = False
         self._near_end_count = 0
         self._playing_post_id = info.post_id if info is not None else ""
@@ -3521,6 +3604,8 @@ class MainWindow(QMainWindow):
     def _on_player_failed(self, text: str):
         self._startup_timer.stop()
         self._hide_overlay()
+        self._stream_loading = False
+        self.screen_inhibitor.release()
         self.stream_status.setText("Ошибка mpv: " + text)
         self.statusBar().showMessage("Ошибка mpv: " + text)
 
@@ -3664,6 +3749,8 @@ class MainWindow(QMainWindow):
         self.centralWidget().layout().setContentsMargins(0, 0, 0, 0)
         self.showFullScreen()
         self.player.set_fullscreen(True)
+        if self.settings.value("hide_cursor_fs", True, type=bool):
+            self.player.set_cursor_autohide(True)
 
     def leave_fullscreen(self):
         if not self.isFullScreen():
@@ -3678,6 +3765,7 @@ class MainWindow(QMainWindow):
         else:
             self.showNormal()
         self.player.set_fullscreen(False)
+        self.player.set_cursor_autohide(False)
 
     def _on_mpv_fullscreen(self, value: bool):
         if value and not self.isFullScreen():
@@ -3714,6 +3802,14 @@ class MainWindow(QMainWindow):
         if old_hwdec != new_hwdec:
             self.player.set_hwdec(str(new_hwdec))
 
+        hide_cursor = self.settings.value(
+            "hide_cursor_fs", True, type=bool
+        )
+        if self.isFullScreen():
+            self.player.set_cursor_autohide(hide_cursor)
+        elif not hide_cursor:
+            self.player.set_cursor_autohide(False)
+
         q_idx = self.quality_combo.findData(new_quality)
         self._suppress_ui = True
         self.quality_combo.setCurrentIndex(q_idx if q_idx >= 0 else 0)
@@ -3728,6 +3824,7 @@ class MainWindow(QMainWindow):
             self._episodes_token += 1
             self._stream_token += 1
             self._startup_timer.stop()
+            self._cancel_next_timer(quiet=True)
             self._hide_overlay()
             self.client = self._new_client()
             self._poster_cache.clear()
@@ -3741,7 +3838,6 @@ class MainWindow(QMainWindow):
             self.play_btn.setEnabled(False)
             self.refresh_catalog(reset=True)
         elif old_source != new_source:
-            # Источник поменялся — перезапускаем текущий поток.
             if self._last_stream is not None and self._title_info is not None:
                 try:
                     path = (
@@ -3771,8 +3867,13 @@ class MainWindow(QMainWindow):
         self._pos_timer.stop()
         self._next_timer.stop()
         self._info_timer.stop()
+        self.player.set_cursor_autohide(False)
         self.next_overlay.hide()
         self.save_position()
+        try:
+            self.screen_inhibitor.release()
+        except Exception:
+            pass
         self._hide_overlay()
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
