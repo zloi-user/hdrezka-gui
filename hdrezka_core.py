@@ -1091,6 +1091,28 @@ class HDrezkaClient:
         query = (query or "").strip()
         if not query:
             return []
+        # Полная страница поиска отдаёт больше результатов, чем быстрый
+        # AJAX-поиск (он ограничен пятью). Именно из-за этого «Стюарт Блум»
+        # не находился по запросу «Стюарт».
+        try:
+            resp = self.request(
+                "GET",
+                "/search/",
+                params={
+                    "do": "search",
+                    "subaction": "search",
+                    "q": query,
+                },
+                headers={"Referer": self.base + "/"},
+            )
+            if resp.status_code < 400:
+                items = parse_catalog_html(resp.text, self.base)
+                if items:
+                    return items
+        except HDrezkaError:
+            pass
+
+        # Запасной вариант — старый AJAX-поиск.
         resp = self.request(
             "GET",
             "/engine/ajax/search.php",
