@@ -145,6 +145,22 @@ def setup_faulthandler():
         _log("faulthandler setup:", e)
 
 
+def setup_excepthook():
+    """Не даём PyQt аварийно завершиться из-за ошибки в слоте."""
+    if getattr(sys, "_hdrezka_excepthook", False):
+        return
+
+    def hook(exc_type, exc, tb):
+        traceback.print_exception(exc_type, exc, tb)
+        try:
+            _log("unhandled exception:", exc)
+        except Exception:
+            pass
+
+    sys.excepthook = hook
+    sys._hdrezka_excepthook = True
+
+
 # --------------------------------------------------------------------------
 # Вспомогательные функции
 # --------------------------------------------------------------------------
@@ -926,8 +942,10 @@ class Player(QObject):
         "f": "fullscreen",
         "F11": "fullscreen",
         "ESC": "escape",
-        "LEFT": "vol_down",
-        "RIGHT": "vol_up",
+        "LEFT": "seek_back",
+        "RIGHT": "seek_forward",
+        "UP": "vol_up",
+        "DOWN": "vol_down",
         "WHEEL_UP": "vol_up",
         "WHEEL_DOWN": "vol_down",
         "m": "mute",
@@ -972,7 +990,7 @@ class Player(QObject):
         self.paused_for_cache = False
         self.cache_pct = None
         self.fullscreen = False
-        self.volume = 50
+        self.volume_value = 50
         self.path = ""
         self.video_params = None
         self._create_mpv()
@@ -1224,7 +1242,7 @@ class Player(QObject):
             if value is None:
                 return
             try:
-                self.volume = int(float(value))
+                self.volume_value = int(float(value))
             except (TypeError, ValueError):
                 pass
 
@@ -1328,10 +1346,10 @@ class Player(QObject):
     def volume(self, delta):
         def _vol():
             try:
-                cur = int(self.volume or 50)
+                cur = int(self.volume_value or 50)
                 target = max(0, min(150, cur + delta))
                 self.mpv.volume = target
-                self.volume = target
+                self.volume_value = target
             except Exception as e:
                 _dbg("volume:", e)
 
@@ -4083,6 +4101,10 @@ class MainWindow(QMainWindow):
             self.toggle_fullscreen()
         elif action == "escape":
             self._on_escape()
+        elif action == "seek_back":
+            self.player.command("seek", "-10", "relative")
+        elif action == "seek_forward":
+            self.player.command("seek", "10", "relative")
         elif action == "vol_up":
             self.player.volume(5)
         elif action == "vol_down":
@@ -4469,6 +4491,7 @@ def main() -> int:
     app.setStyle("Fusion")
     app.setApplicationDisplayName(APP_TITLE)
     setup_faulthandler()
+    setup_excepthook()
     try:
         locale.setlocale(locale.LC_NUMERIC, "C")
     except locale.Error:
