@@ -314,7 +314,7 @@ class CatalogWorker(QThread):
 
     def __init__(
         self, client, section: str, page: int, genre: str,
-        year: str, token: int, parent=None,
+        year: str, rating: str, token: int, parent=None,
     ):
         super().__init__(parent)
         self.client = client
@@ -322,6 +322,7 @@ class CatalogWorker(QThread):
         self.page = page
         self.genre = genre
         self.year = year
+        self.rating = rating
         self.token = token
 
     def run(self):
@@ -332,7 +333,8 @@ class CatalogWorker(QThread):
                 genres = []
             else:
                 items, has_more, genres = self.client.fetch_catalog(
-                    self.section, self.page, self.genre, self.year
+                    self.section, self.page, self.genre, self.year,
+                    self.rating,
                 )
             self.done.emit(
                 self.token,
@@ -343,6 +345,7 @@ class CatalogWorker(QThread):
                     "section": self.section,
                     "genre": self.genre,
                     "year": self.year,
+                    "rating": self.rating,
                     "genres": genres,
                     "error": "",
                 },
@@ -358,6 +361,7 @@ class CatalogWorker(QThread):
                     "section": self.section,
                     "genre": self.genre,
                     "year": self.year,
+                    "rating": self.rating,
                     "genres": [],
                     "error": str(e),
                 },
@@ -1854,6 +1858,7 @@ class MainWindow(QMainWindow):
         self._catalog_section = "home"
         self._catalog_genre = ""
         self._catalog_year = ""
+        self._catalog_rating = ""
         self._catalog_page = 1
         self._has_more = False
         self._search_active = False
@@ -2193,6 +2198,17 @@ class MainWindow(QMainWindow):
         )
         self.year_combo.setEnabled(False)
 
+        self.rating_combo = QComboBox()
+        self.rating_combo.addItem("Любой рейтинг", "")
+        for value in ("5.0", "6.0", "7.0", "7.5", "8.0", "8.5", "9.0"):
+            self.rating_combo.addItem(f"от {value}", value)
+        self.rating_combo.setMinimumWidth(110)
+        self.rating_combo.setToolTip(
+            "Фильтр по рейтингу HDrezka. Работает в подборках «Лучшее»; "
+            "для «Новинок», «ТВ-шоу» и «Избранного» недоступен."
+        )
+        self.rating_combo.setEnabled(False)
+
         self.search = QLineEdit()
         self.search.setPlaceholderText("Поиск фильма или сериала…")
         self.search.setClearButtonEnabled(True)
@@ -2250,6 +2266,7 @@ class MainWindow(QMainWindow):
         row.addWidget(self.catalog_combo)
         row.addWidget(self.genre_combo)
         row.addWidget(self.year_combo)
+        row.addWidget(self.rating_combo)
         row.addWidget(self.search, 1)
         row.addWidget(self.list_btn)
         row.addWidget(self.info_btn)
@@ -2463,6 +2480,9 @@ class MainWindow(QMainWindow):
         )
         self.year_combo.currentIndexChanged.connect(
             self._on_year_changed
+        )
+        self.rating_combo.currentIndexChanged.connect(
+            self._on_rating_changed
         )
         self.translation_combo.currentIndexChanged.connect(
             self._on_translation_changed
@@ -3253,6 +3273,7 @@ class MainWindow(QMainWindow):
         self.more_btn.setEnabled(False)
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
+        self.rating_combo.setEnabled(False)
         if start_meta and not missing:
             self._populate_list(items, select_url=self._current_url or None)
         else:
@@ -3353,6 +3374,10 @@ class MainWindow(QMainWindow):
             self._catalog_year
             if section not in ("home", "show") else ""
         )
+        rating = (
+            self._catalog_rating
+            if section not in ("home", "show", "favorites") else ""
+        )
         page = 1 if reset else self._catalog_page + 1
         self._catalog_token += 1
         token = self._catalog_token
@@ -3362,7 +3387,7 @@ class MainWindow(QMainWindow):
             "Загрузка каталога…" if reset else f"Загрузка страницы {page}…"
         )
         worker = CatalogWorker(
-            self.client, section, page, genre, year, token, self
+            self.client, section, page, genre, year, rating, token, self
         )
         self._catalog_worker = worker
         self._track_worker(worker)
@@ -3392,12 +3417,15 @@ class MainWindow(QMainWindow):
         section = str((result or {}).get("section") or "home")
         genre = str((result or {}).get("genre") or "")
         year = str((result or {}).get("year") or "")
+        rating = str((result or {}).get("rating") or "")
         genres = (result or {}).get("genres") or []
         if page <= 1:
             self._catalog_genre = genre
             self._catalog_year = year
+            self._catalog_rating = rating
             self._update_genres(genres, section)
             self._update_year_enabled(section)
+            self._update_rating_enabled(section)
 
         if page <= 1:
             new_items = list(items)
@@ -3414,6 +3442,7 @@ class MainWindow(QMainWindow):
             self.catalog_items = new_items
             self.genre_combo.setEnabled(False)
             self.year_combo.setEnabled(False)
+            self.rating_combo.setEnabled(False)
             self.more_btn.setVisible(False)
             if section == "home" and page == 1:
                 self._save_cache()
@@ -3488,6 +3517,29 @@ class MainWindow(QMainWindow):
         self.catalog_items = []
         self.refresh_catalog(reset=True)
 
+    def _update_rating_enabled(self, section: str):
+        enabled = (
+            section not in ("home", "show", "favorites")
+            and not self.search.text().strip()
+        )
+        self._suppress_ui = True
+        self.rating_combo.setEnabled(enabled)
+        if not enabled and self.rating_combo.currentIndex() != 0:
+            self.rating_combo.setCurrentIndex(0)
+            self._catalog_rating = ""
+        self._suppress_ui = False
+
+    def _on_rating_changed(self):
+        if self._suppress_ui:
+            return
+        self._catalog_rating = str(
+            self.rating_combo.currentData() or ""
+        )
+        self._catalog_page = 1
+        self._has_more = False
+        self.catalog_items = []
+        self.refresh_catalog(reset=True)
+
     def load_more(self):
         if not self._has_more:
             return
@@ -3508,6 +3560,7 @@ class MainWindow(QMainWindow):
         self._search_token += 1          # отменяем возможный старый поиск
         self._catalog_genre = ""
         self._catalog_year = ""
+        self._catalog_rating = ""
         self._catalog_page = 1
         self._has_more = False
         self.catalog_items = []
@@ -3517,6 +3570,8 @@ class MainWindow(QMainWindow):
         self.genre_combo.setEnabled(False)
         self.year_combo.setCurrentIndex(0)
         self.year_combo.setEnabled(False)
+        self.rating_combo.setCurrentIndex(0)
+        self.rating_combo.setEnabled(False)
         self._suppress_ui = False
         self.refresh_catalog(reset=True)
 
@@ -3535,11 +3590,13 @@ class MainWindow(QMainWindow):
                 and self.genre_combo.count() > 1
             )
             self._update_year_enabled(section)
+            self._update_rating_enabled(section)
             if section == "favorites":
                 self.more_btn.setVisible(False)
             return
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
+        self.rating_combo.setEnabled(False)
         self.more_btn.setVisible(False)
         self._search_timer.start()
 
@@ -3574,6 +3631,7 @@ class MainWindow(QMainWindow):
         self._populate_list(items, select_url="")
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
+        self.rating_combo.setEnabled(False)
         self.more_btn.setVisible(False)
         if items:
             self.statusBar().showMessage(
@@ -3609,6 +3667,13 @@ class MainWindow(QMainWindow):
                     label = f"{label} ({item.year})"
                 if item.genres:
                     label = f"{label}  ·  {item.genres}"
+                rating_text = (item.rating or "").strip()
+                try:
+                    float(rating_text)
+                except (TypeError, ValueError):
+                    rating_text = ""
+                if rating_text:
+                    label = f"{label}  ·  ★ {rating_text}"
                 node = QTreeWidgetItem([label])
                 node.setData(
                     0, Qt.ItemDataRole.UserRole, item.to_dict()

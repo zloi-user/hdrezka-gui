@@ -354,6 +354,14 @@ def parse_catalog_html(text: str, base: str) -> List[SearchItem]:
         if info_m:
             info = clean_text(info_m.group(1))
 
+        rating = ""
+        rate_m = re.search(
+            r'b-category-bestrating[^>]*>\s*\(?([\d.]+)\)?',
+            chunk,
+        )
+        if rate_m:
+            rating = rate_m.group(1)
+
         kind = kind_from_url(url)
         if not kind or kind == "Другое":
             cat_m = re.search(r'<span class="cat\s+(\w+)"', chunk)
@@ -371,6 +379,7 @@ def parse_catalog_html(text: str, base: str) -> List[SearchItem]:
                 poster=poster,
                 info=info,
                 genres=genres_from_misc(misc),
+                rating=rating,
             )
         )
     return items
@@ -1053,7 +1062,7 @@ class HDrezkaClient:
 
     def fetch_catalog(
         self, section: str, page: int = 1, genre: str = "",
-        year: str = "",
+        year: str = "", rating_min: float = 0.0,
     ) -> Tuple[List[SearchItem], bool, List[Tuple[str, str]]]:
         section = (section or "films").strip("/")
         path_section = SECTION_PATHS.get(section, section)
@@ -1063,13 +1072,18 @@ class HDrezkaClient:
             )
         genre = (genre or "").strip("/")
         year = (year or "").strip("/")
-        if year:
-            # Год на сайте есть только в подборках «Лучшее»:
+        try:
+            min_rating = float(rating_min or 0)
+        except (TypeError, ValueError):
+            min_rating = 0.0
+        if year or min_rating > 0:
+            # Год и рейтинг есть только в подборках «Лучшее»:
             # /films/best/2024/, /films/best/action/2024/.
             base = f"/{path_section}/best/"
             if genre:
                 base += f"{genre}/"
-            base += f"{year}/"
+            if year:
+                base += f"{year}/"
         else:
             base = f"/{path_section}/"
             if genre:
@@ -1082,10 +1096,32 @@ class HDrezkaClient:
         has_more = bool(
             re.search(rf'href="[^"]*page/{page + 1}/"', resp.text)
         )
+        if min_rating > 0:
+            ratings = []
+            for item in items:
+                try:
+                    ratings.append(float(item.rating))
+                except (TypeError, ValueError):
+                    continue
+            items = [
+                item for item in items
+                if self._rating_value(item.rating) >= min_rating
+            ]
+            # Страницы «Лучшее» отсортированы по рейтингу вниз.
+            # Если последний рейтинг уже ниже порога, дальше совпадений нет.
+            if ratings and min(ratings) < min_rating:
+                has_more = False
         genres = (
             parse_genres(resp.text, section) if page <= 1 else []
         )
         return items, has_more, genres
+
+    @staticmethod
+    def _rating_value(value) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
 
     def search(self, query: str) -> List[SearchItem]:
         query = (query or "").strip()
