@@ -27,6 +27,7 @@ import faulthandler
 import io
 import json
 import locale
+import math
 import os
 import queue
 import signal
@@ -49,12 +50,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from PyQt6.QtCore import (
-        QObject, QSettings, QStandardPaths, Qt, QThread, QTimer,
-        pyqtSignal,
+        QObject, QPointF, QSettings, QSize, QStandardPaths, Qt, QThread,
+        QTimer, pyqtSignal,
     )
     from PyQt6.QtGui import (
         QBrush, QColor, QCursor, QIcon, QKeySequence, QOpenGLContext,
-        QPixmap, QShortcut,
+        QPainter, QPen, QPixmap, QPolygonF, QShortcut,
     )
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtWidgets import (
@@ -222,6 +223,14 @@ def positions_file() -> str:
     return os.path.join(cache_dir(), "positions.json")
 
 
+def favorites_file() -> str:
+    return os.path.join(cache_dir(), "favorites.json")
+
+
+def favorites_cache_file() -> str:
+    return os.path.join(cache_dir(), "favorites_cache.json")
+
+
 def initials(name: str) -> str:
     text = (name or "").replace("«", "").replace("»", "")
     text = text.replace('"', "").strip()
@@ -246,6 +255,54 @@ def themed_icon(widget, theme_names, standard):
         return widget.style().standardIcon(standard)
     except Exception:
         return QIcon()
+
+
+def star_icon(filled: bool) -> QIcon:
+    """Звезда для кнопки избранного (тема или нарисованная)."""
+    names = (
+        ("starred", "starred-symbolic", "rating")
+        if filled else
+        ("non-starred", "non-starred-symbolic")
+    )
+    for name in names:
+        try:
+            icon = QIcon.fromTheme(name)
+        except Exception:
+            icon = QIcon()
+        if not icon.isNull():
+            return icon
+
+    size = 20
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pix)
+    try:
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        cx = cy = size / 2.0
+        outer = size * 0.46
+        inner = outer * 0.44
+        points = []
+        for i in range(10):
+            angle = math.radians(-90 + i * 36)
+            radius = outer if i % 2 == 0 else inner
+            points.append(
+                QPointF(
+                    cx + radius * math.cos(angle),
+                    cy + radius * math.sin(angle),
+                )
+            )
+        pen = QPen(QColor("#b8860b" if filled else "#8a8a8a"))
+        pen.setWidthF(1.4)
+        painter.setPen(pen)
+        painter.setBrush(
+            QBrush(QColor("#f2b01e"))
+            if filled else
+            QBrush(Qt.BrushStyle.NoBrush)
+        )
+        painter.drawPolygon(QPolygonF(points))
+    finally:
+        painter.end()
+    return QIcon(pix)
 
 
 # --------------------------------------------------------------------------
@@ -508,6 +565,42 @@ class PosterWorker(QThread):
             _dbg("poster:", e)
             data = b""
         self.done.emit(self.url, data)
+
+
+class FavoritesMetaWorker(QThread):
+    done = pyqtSignal(object)
+
+    MAX_ITEMS = 6
+
+    def __init__(self, client, entries, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.entries = list(entries or [])[: self.MAX_ITEMS]
+
+    def run(self):
+        result = {}
+        failures = 0
+        for post_id, url in self.entries:
+            try:
+                info = self.client.fetch_title(url)
+            except Exception as e:
+                _dbg("favorite meta:", post_id, e)
+                failures += 1
+                if failures >= 2:
+                    break
+                continue
+            failures = 0
+            result[str(post_id)] = {
+                "title": info.title,
+                "year": info.year,
+                "kind": info.kind,
+                "poster": info.poster,
+                "rating": info.rating,
+                "genres": info.genres,
+                "meta": "",
+                "updated_at": int(time.time()),
+            }
+        self.done.emit(result)
 
 
 _PROXY_WORKERS = set()
@@ -1770,6 +1863,8 @@ class MainWindow(QMainWindow):
         self._episodes_token = 0
         self._episodes_preferred_episode = ""
         self._stream_token = 0
+        self._fav_meta_token = 0
+        self._fav_meta_worker = None
 
         self._title_info: Optional[core.TitleInfo] = None
         self._episodes: Dict[str, List[core.Episode]] = {}
@@ -2068,10 +2163,14 @@ class MainWindow(QMainWindow):
         row.setSpacing(6)
 
         self.catalog_combo = QComboBox()
+        self.catalog_combo.addItem("⭐ Избранное", "favorites")
         for key, label in core.CATALOG_SECTIONS:
             self.catalog_combo.addItem(label, key)
+        home_idx = self.catalog_combo.findData("home")
+        if home_idx >= 0:
+            self.catalog_combo.setCurrentIndex(home_idx)
         self.catalog_combo.setMinimumWidth(130)
-        self.catalog_combo.setToolTip("Раздел каталога")
+        self.catalog_combo.setToolTip("Раздел каталога и локальное избранное")
 
         self.genre_combo = QComboBox()
         self.genre_combo.addItem("Все жанры", "")
@@ -2229,6 +2328,17 @@ class MainWindow(QMainWindow):
         text_col.addWidget(self.rating_label)
         text_col.addStretch(1)
         header.addLayout(text_col, 1)
+
+        self.fav_btn = QPushButton()
+        self.fav_btn.setFixedSize(30, 30)
+        self.fav_btn.setFlat(True)
+        self.fav_btn.setIcon(star_icon(False))
+        self.fav_btn.setIconSize(QSize(20, 20))
+        self.fav_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.fav_btn.setToolTip("Добавить в избранное")
+        self.fav_btn.clicked.connect(self._toggle_favorite)
+        self.fav_btn.setVisible(False)
+        header.addWidget(self.fav_btn, 0, Qt.AlignmentFlag.AlignTop)
         info.addLayout(header)
 
         self.desc = QTextEdit()
@@ -2954,6 +3064,266 @@ class MainWindow(QMainWindow):
             return
         self.leave_fullscreen()
 
+    # ---------- избранное ----------
+    @staticmethod
+    def _read_json(path: str, default):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return default
+
+    @staticmethod
+    def _write_json(path: str, data) -> bool:
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=2)
+                fh.write("\n")
+            os.replace(tmp, path)
+            return True
+        except OSError as e:
+            _log("favorites save:", e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+
+    def _load_favorites(self) -> List[dict]:
+        data = self._read_json(favorites_file(), {})
+        if isinstance(data, dict):
+            raw = data.get("items") or []
+        elif isinstance(data, list):
+            raw = data
+        else:
+            raw = []
+        result = []
+        seen = set()
+        for entry in raw:
+            if isinstance(entry, str):
+                post_id = entry
+                added_at = 0
+            elif isinstance(entry, dict):
+                post_id = str(
+                    entry.get("post_id") or entry.get("id") or ""
+                )
+                try:
+                    added_at = int(entry.get("added_at") or 0)
+                except (TypeError, ValueError):
+                    added_at = 0
+            else:
+                continue
+            post_id = post_id.strip()
+            if not post_id.isdigit() or post_id in seen:
+                continue
+            seen.add(post_id)
+            result.append({"post_id": post_id, "added_at": added_at})
+        result.sort(key=lambda item: item["added_at"], reverse=True)
+        return result
+
+    def _save_favorites(self, items: List[dict]):
+        self._write_json(
+            favorites_file(),
+            {"version": 1, "items": items},
+        )
+
+    def _load_favorites_cache(self) -> dict:
+        data = self._read_json(favorites_cache_file(), {})
+        if not isinstance(data, dict):
+            return {}
+        return {
+            str(key): value
+            for key, value in data.items()
+            if str(key).isdigit() and isinstance(value, dict)
+        }
+
+    def _save_favorites_cache(self, cache: dict):
+        self._write_json(favorites_cache_file(), cache)
+
+    def _favorite_url(self, post_id: str) -> str:
+        return f"{self.client.base}/?newsid={post_id}"
+
+    def _is_favorite(self, post_id: str) -> bool:
+        post_id = str(post_id or "")
+        if not post_id:
+            return False
+        return any(
+            item["post_id"] == post_id for item in self._load_favorites()
+        )
+
+    @staticmethod
+    def _favorite_meta_from_info(info: core.TitleInfo) -> dict:
+        meta = " · ".join(
+            part for part in (info.year, info.country, info.genres) if part
+        )
+        return {
+            "title": info.title,
+            "year": info.year,
+            "kind": info.kind,
+            "poster": info.poster,
+            "rating": info.rating,
+            "genres": info.genres,
+            "meta": meta,
+            "updated_at": int(time.time()),
+        }
+
+    def _update_fav_button(self):
+        info = self._title_info
+        if info is None or not str(info.post_id or ""):
+            self.fav_btn.setVisible(False)
+            return
+        self.fav_btn.setVisible(True)
+        is_fav = self._is_favorite(info.post_id)
+        self.fav_btn.setIcon(star_icon(is_fav))
+        self.fav_btn.setToolTip(
+            "Удалить из избранного"
+            if is_fav else
+            "Добавить в избранное"
+        )
+
+    def _toggle_favorite(self):
+        info = self._title_info
+        if info is None or not str(info.post_id or ""):
+            return
+        post_id = str(info.post_id)
+        items = self._load_favorites()
+        found = False
+        new_items = []
+        for entry in items:
+            if entry["post_id"] == post_id:
+                found = True
+            else:
+                new_items.append(entry)
+        cache = self._load_favorites_cache()
+        if found:
+            self._save_favorites(new_items)
+            cache.pop(post_id, None)
+            self._save_favorites_cache(cache)
+            message = "Удалено из избранного"
+        else:
+            new_items.insert(
+                0, {"post_id": post_id, "added_at": int(time.time())}
+            )
+            self._save_favorites(new_items)
+            cache[post_id] = self._favorite_meta_from_info(info)
+            self._save_favorites_cache(cache)
+            message = "Добавлено в избранное"
+        self._update_fav_button()
+        section = str(self.catalog_combo.currentData() or "")
+        if section == "favorites" and not self.search.text().strip():
+            self._render_favorites(start_meta=False)
+        self.statusBar().showMessage(
+            message + f": {info.title}", 6000
+        )
+
+    def _favorites_items(self):
+        entries = self._load_favorites()
+        cache = self._load_favorites_cache()
+        items = []
+        missing = []
+        for entry in entries:
+            post_id = entry["post_id"]
+            meta = cache.get(post_id) or {}
+            url = self._favorite_url(post_id)
+            title = str(meta.get("title") or "").strip()
+            if not title:
+                title = f"Тайтл #{post_id}"
+                missing.append((post_id, url))
+            items.append(
+                core.SearchItem(
+                    title=title,
+                    url=url,
+                    kind=str(meta.get("kind") or ""),
+                    year=str(meta.get("year") or ""),
+                    meta=str(meta.get("meta") or ""),
+                    rating=str(meta.get("rating") or ""),
+                    poster=str(meta.get("poster") or ""),
+                    genres=str(meta.get("genres") or ""),
+                )
+            )
+        return items, missing
+
+    def _render_favorites(self, start_meta: bool = True):
+        items, missing = self._favorites_items()
+        self.catalog_items = items
+        self._catalog_page = 1
+        self._has_more = False
+        self.more_btn.setVisible(False)
+        self.more_btn.setEnabled(False)
+        self.genre_combo.setEnabled(False)
+        self.year_combo.setEnabled(False)
+        if start_meta and not missing:
+            self._populate_list(items, select_url=self._current_url or None)
+        else:
+            self.list.blockSignals(True)
+            try:
+                self._populate_list(
+                    items, select_url=self._current_url or None
+                )
+            finally:
+                self.list.blockSignals(False)
+        if not items and not self._playing_key:
+            self._title_info = None
+            self.title_label.setText("Избранное пусто")
+            self.meta_label.setText(
+                "Добавьте фильм или сериал звёздочкой в правом верхнем углу"
+            )
+            self.rating_label.setText("")
+            self.desc.setPlainText("")
+            self._set_poster_placeholder("★")
+            self.play_btn.setEnabled(False)
+            self.copy_btn.setEnabled(False)
+            self.translation_combo.clear()
+            self.season_combo.clear()
+            self.episode_combo.clear()
+            self.fav_btn.setVisible(False)
+            self.stream_status.setText("Избранное пусто")
+        count = len(items)
+        self.statusBar().showMessage(
+            f"Избранное: {count}" if count else "Избранное пусто", 6000
+        )
+        if start_meta and missing:
+            self._start_favorites_meta_worker(missing)
+
+    def _start_favorites_meta_worker(self, missing):
+        if not missing:
+            return
+        try:
+            running = (
+                self._fav_meta_worker is not None
+                and self._fav_meta_worker.isRunning()
+            )
+        except RuntimeError:
+            running = False
+            self._fav_meta_worker = None
+        if running:
+            return
+        self._fav_meta_token += 1
+        token = self._fav_meta_token
+        worker = FavoritesMetaWorker(self.client, missing, self)
+        self._fav_meta_worker = worker
+        self._track_worker(worker)
+        worker.done.connect(
+            lambda result, t=token: self._on_favorites_meta_done(t, result)
+        )
+        worker.start()
+
+    def _on_favorites_meta_done(self, token: int, result: dict):
+        if token != self._fav_meta_token:
+            return
+        self._fav_meta_worker = None
+        if not result:
+            return
+        cache = self._load_favorites_cache()
+        cache.update(result)
+        self._save_favorites_cache(cache)
+        if (
+            str(self.catalog_combo.currentData() or "") == "favorites"
+            and not self.search.text().strip()
+        ):
+            self._render_favorites(start_meta=False)
+
     # ---------- каталог/поиск ----------
     def refresh_clicked(self):
         if self.search.text().strip():
@@ -2972,6 +3342,12 @@ class MainWindow(QMainWindow):
             self._run_search()
             return
         section = str(self.catalog_combo.currentData() or "home")
+        if section == "favorites":
+            self._catalog_token += 1
+            self._catalog_worker = None
+            self.refresh_btn.setEnabled(True)
+            self._render_favorites()
+            return
         genre = self._catalog_genre if section != "home" else ""
         year = (
             self._catalog_year
@@ -3075,7 +3451,7 @@ class MainWindow(QMainWindow):
             self._catalog_genre = ""
         self.genre_combo.setCurrentIndex(idx)
         enabled = (
-            section != "home"
+            section not in ("home", "favorites")
             and self.genre_combo.count() > 1
             and not self.search.text().strip()
         )
@@ -3093,7 +3469,7 @@ class MainWindow(QMainWindow):
 
     def _update_year_enabled(self, section: str):
         enabled = (
-            section not in ("home", "show")
+            section not in ("home", "show", "favorites")
             and not self.search.text().strip()
         )
         self._suppress_ui = True
@@ -3116,6 +3492,8 @@ class MainWindow(QMainWindow):
         if not self._has_more:
             return
         if self.search.text().strip():
+            return
+        if str(self.catalog_combo.currentData() or "") == "favorites":
             return
         self.refresh_catalog(reset=False)
 
@@ -3153,9 +3531,12 @@ class MainWindow(QMainWindow):
             self.more_btn.setVisible(self._has_more)
             section = str(self.catalog_combo.currentData() or "home")
             self.genre_combo.setEnabled(
-                section != "home" and self.genre_combo.count() > 1
+                section not in ("home", "favorites")
+                and self.genre_combo.count() > 1
             )
             self._update_year_enabled(section)
+            if section == "favorites":
+                self.more_btn.setVisible(False)
             return
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
@@ -3322,6 +3703,7 @@ class MainWindow(QMainWindow):
         self._episodes_token += 1
         self._stream_token += 1
         self._title_info = None
+        self._update_fav_button()
         self._episodes = {}
         self._seasons = {}
         self._last_stream = None
@@ -3397,6 +3779,16 @@ class MainWindow(QMainWindow):
 
     def _apply_title(self, info: core.TitleInfo):
         self._title_info = info
+        self._update_fav_button()
+        if self._is_favorite(info.post_id):
+            cache = self._load_favorites_cache()
+            cache[str(info.post_id)] = self._favorite_meta_from_info(info)
+            self._save_favorites_cache(cache)
+            if (
+                str(self.catalog_combo.currentData() or "") == "favorites"
+                and not self.search.text().strip()
+            ):
+                self._render_favorites(start_meta=False)
         if self._startup_resume_url and not self._is_startup_resume(info):
             self._autoplay_last_pending = False
         restore = False
