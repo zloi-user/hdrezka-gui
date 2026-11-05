@@ -24,12 +24,14 @@ from __future__ import annotations
 
 import ctypes
 import faulthandler
+import html as html_module
 import io
 import json
 import locale
 import math
 import os
 import queue
+import re
 import signal
 import subprocess
 import sys
@@ -60,10 +62,11 @@ try:
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtWidgets import (
         QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,
-        QDialogButtonBox, QFrame, QGridLayout, QHBoxLayout, QLabel,
-        QLineEdit, QMainWindow, QMessageBox, QPushButton, QSizePolicy,
-        QSplitter, QSpinBox, QStyle, QTextEdit, QTreeWidget, QTreeWidgetItem,
-        QVBoxLayout, QWidget,
+        QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+        QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
+        QPushButton, QSizePolicy, QSplitter, QSpinBox, QStyle,
+        QTableWidget, QTableWidgetItem, QTextEdit, QTreeWidget,
+        QTreeWidgetItem, QVBoxLayout, QWidget,
     )
 except ImportError:  # pragma: no cover
     sys.exit("Не найден PyQt6. Установите: python3 -m pip install PyQt6")
@@ -93,6 +96,12 @@ SOURCE_OPTIONS = [
     ("HLS (m3u8)", "hls"),
     ("MP4 (файл)", "mp4"),
 ]
+
+HIDEIP_HTTPS_URL = (
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/"
+    "refs/heads/main/https.txt"
+)
+HIDEIP_HEADER = "https прокси от hideip.me"
 
 # Сколько ждать первый сегмент HLS, прежде чем автоматически
 # переключиться на прямой MP4 (режим «Авто»).
@@ -547,6 +556,66 @@ class CheckWorker(QThread):
                 bridge.close()
 
 
+class ProxyListWorker(QThread):
+    """Загружает список HTTPS-прокси hideip.me."""
+
+    done = pyqtSignal(int, str, object)
+
+    def __init__(self, token: int, proxy: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self.token = token
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            attempts = []
+            if self.proxy:
+                attempts.append(self.proxy)
+            attempts.append(None)
+            raw = b""
+            last_error: Optional[Exception] = None
+            for proxy in attempts:
+                try:
+                    raw = core.fetch_bytes(
+                        HIDEIP_HTTPS_URL,
+                        proxy=proxy,
+                        timeout=10.0 if proxy else 15.0,
+                    )
+                    break
+                except Exception as e:
+                    last_error = e
+            else:
+                raise last_error or RuntimeError("нет соединения")
+            text = raw.decode("utf-8", "replace")
+            entries = []
+            seen = set()
+            for line in text.splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(":", 2)
+                if len(parts) < 2:
+                    continue
+                host = parts[0].strip()
+                port = parts[1].strip()
+                country = parts[2].strip() if len(parts) > 2 else ""
+                if not host or not port.isdigit():
+                    continue
+                url = f"https://{host}:{port}"
+                if url in seen:
+                    continue
+                seen.add(url)
+                label = f"{host}:{port}"
+                if country:
+                    label += f" — {country}"
+                entries.append((url, label, country))
+            entries.sort(key=lambda e: (e[2].lower(), e[1]))
+            self.done.emit(self.token, "", entries)
+        except Exception as e:
+            _dbg("proxy list:", e)
+            self.done.emit(self.token, str(e), [])
+
+
 class PosterWorker(QThread):
     done = pyqtSignal(str, bytes)
 
@@ -607,6 +676,27 @@ class FavoritesMetaWorker(QThread):
         self.done.emit(result)
 
 
+class PersonWorker(QThread):
+    done = pyqtSignal(int, object)
+
+    def __init__(self, client, url: str, section: str, token: int, parent=None):
+        super().__init__(parent)
+        self.client = client
+        self.url = url
+        self.section = section
+        self.token = token
+
+    def run(self):
+        try:
+            items = self.client.fetch_person(self.url, self.section)
+            self.done.emit(self.token, {"items": items, "error": ""})
+        except Exception as e:
+            _dbg("person:", e)
+            self.done.emit(
+                self.token, {"items": [], "error": str(e)}
+            )
+
+
 _PROXY_WORKERS = set()
 
 
@@ -618,6 +708,15 @@ def _forget_worker(worker):
 # --------------------------------------------------------------------------
 # mpv: render API в QOpenGLWidget + очередь команд
 # --------------------------------------------------------------------------
+
+class ClickableLabel(QLabel):
+    clicked = pyqtSignal()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.clicked.emit()
+        super().mouseReleaseEvent(event)
+
 
 class VideoOverlay(QLabel):
     """Полупрозрачная плашка поверх видео: подготовка/буферизация."""
@@ -1498,6 +1597,258 @@ class Player(QObject):
 # Диалог настроек
 # --------------------------------------------------------------------------
 
+class HideIPDialog(QDialog):
+    """Таблица HTTPS-прокси с фильтром по стране."""
+
+    def __init__(self, proxy: Optional[str] = None, parent=None):
+        super().__init__(parent)
+        self._proxy = proxy or ""
+        self._entries = []
+        self._worker = None
+        self._token = 0
+        self.selected_proxy = ""
+
+        self.setWindowTitle("HTTPS-прокси от hideip.me")
+        self.setModal(True)
+        self.resize(700, 560)
+
+        root = QVBoxLayout(self)
+        title = QLabel(HIDEIP_HEADER)
+        title.setStyleSheet(
+            "font-size:15px; font-weight:600; color:#333;"
+        )
+        root.addWidget(title)
+
+        filters = QHBoxLayout()
+        filters.setSpacing(6)
+        filters.addWidget(QLabel("Страна:"))
+        self.country_combo = QComboBox()
+        self.country_combo.setMinimumWidth(200)
+        self.country_combo.addItem("Все страны", "")
+        filters.addWidget(self.country_combo)
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText(
+            "Фильтр по IP или стране…"
+        )
+        self.search_edit.setClearButtonEnabled(True)
+        filters.addWidget(self.search_edit, 1)
+        self.refresh_btn = QPushButton("Обновить")
+        self.refresh_btn.setIcon(themed_icon(
+            self, ("view-refresh", "view-refresh-symbolic"),
+            QStyle.StandardPixmap.SP_BrowserReload,
+        ))
+        self.refresh_btn.setToolTip(
+            "Заново загрузить список с hideip.me"
+        )
+        filters.addWidget(self.refresh_btn)
+        root.addLayout(filters)
+
+        self.table = QTableWidget(0, 2)
+        self.table.setHorizontalHeaderLabels(["IP:порт", "Страна"])
+        self.table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows
+        )
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.SingleSelection
+        )
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.NoEditTriggers
+        )
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setVisible(False)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(
+            0, QHeaderView.ResizeMode.Stretch
+        )
+        header.setSectionResizeMode(
+            1, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.table.setToolTip(
+            "Двойной клик по строке — выбрать прокси"
+        )
+        root.addWidget(self.table, 1)
+
+        bottom = QHBoxLayout()
+        self.count_label = QLabel("Загрузка списка…")
+        self.count_label.setStyleSheet("color:#777;")
+        bottom.addWidget(self.count_label, 1)
+        self.pick_btn = QPushButton("Выбрать")
+        self.pick_btn.setDefault(True)
+        self.pick_btn.setEnabled(False)
+        bottom.addWidget(self.pick_btn)
+        self.cancel_btn = QPushButton("Отмена")
+        bottom.addWidget(self.cancel_btn)
+        root.addLayout(bottom)
+
+        self.country_combo.currentIndexChanged.connect(
+            self._apply_filter
+        )
+        self.search_edit.textChanged.connect(self._apply_filter)
+        self.refresh_btn.clicked.connect(self._load)
+        self.pick_btn.clicked.connect(self._accept_selected)
+        self.cancel_btn.clicked.connect(self.reject)
+        self.table.itemSelectionChanged.connect(
+            self._update_pick_enabled
+        )
+        self.table.itemActivated.connect(
+            lambda _item: self._accept_selected()
+        )
+
+        self._load()
+
+    @staticmethod
+    def _url_key(value) -> str:
+        text = str(value or "").strip().lower()
+        if "://" in text:
+            text = text.split("://", 1)[1]
+        return text
+
+    def _update_pick_enabled(self):
+        self.pick_btn.setEnabled(
+            bool(self.table.selectionModel().selectedRows())
+        )
+
+    def _apply_filter(self):
+        country = str(self.country_combo.currentData() or "")
+        needle = self.search_edit.text().strip().lower()
+        shown = 0
+        self.table.setUpdatesEnabled(False)
+        self.table.clearSelection()
+        try:
+            for row in range(self.table.rowCount()):
+                ip_item = self.table.item(row, 0)
+                country_item = self.table.item(row, 1)
+                if ip_item is None or country_item is None:
+                    continue
+                row_country = country_item.text()
+                ok = not country or row_country == country
+                if ok and needle:
+                    haystack = (
+                        ip_item.text().lower()
+                        + " "
+                        + row_country.lower()
+                    )
+                    ok = needle in haystack
+                self.table.setRowHidden(row, not ok)
+                if ok:
+                    shown += 1
+        finally:
+            self.table.setUpdatesEnabled(True)
+        total = self.table.rowCount()
+        if total:
+            self.count_label.setText(
+                f"Показано {shown} из {total}"
+            )
+        self._update_pick_enabled()
+
+    def _fill_countries(self):
+        previous = str(self.country_combo.currentData() or "")
+        countries = sorted(
+            {
+                country
+                for _url, _label, country in self._entries
+                if country
+            },
+            key=str.casefold,
+        )
+        self.country_combo.blockSignals(True)
+        try:
+            self.country_combo.clear()
+            self.country_combo.addItem("Все страны", "")
+            for country in countries:
+                self.country_combo.addItem(country, country)
+            index = self.country_combo.findData(previous)
+            self.country_combo.setCurrentIndex(
+                index if index >= 0 else 0
+            )
+        finally:
+            self.country_combo.blockSignals(False)
+
+    def _load(self):
+        try:
+            if self._worker is not None and self._worker.isRunning():
+                return
+        except RuntimeError:
+            self._worker = None
+        self._token += 1
+        token = self._token
+        self.refresh_btn.setEnabled(False)
+        self.pick_btn.setEnabled(False)
+        self.count_label.setText("Загрузка списка…")
+        self.count_label.setToolTip("")
+        self.table.setRowCount(0)
+        worker = ProxyListWorker(token, self._proxy)
+        self._worker = worker
+        _PROXY_WORKERS.add(worker)
+        worker.done.connect(self._on_loaded)
+        worker.finished.connect(lambda w=worker: _forget_worker(w))
+        worker.start()
+
+    def _on_loaded(self, token: int, error: str, entries):
+        if token != self._token:
+            return
+        self._worker = None
+        self.refresh_btn.setEnabled(True)
+        if error:
+            self.count_label.setText(
+                "Не удалось загрузить список"
+            )
+            self.count_label.setToolTip(error)
+            return
+        self._entries = list(entries or [])
+        if not self._entries:
+            self.count_label.setText("Список пуст")
+            return
+
+        self.table.setSortingEnabled(False)
+        self.table.setRowCount(len(self._entries))
+        for row, (url, label, country) in enumerate(self._entries):
+            host = urllib.parse.urlparse(url).netloc or label
+            ip_item = QTableWidgetItem(host)
+            ip_item.setData(Qt.ItemDataRole.UserRole, url)
+            ip_item.setToolTip(url)
+            country_item = QTableWidgetItem(country or "—")
+            self.table.setItem(row, 0, ip_item)
+            self.table.setItem(row, 1, country_item)
+        self.table.setSortingEnabled(True)
+        self.table.sortItems(1, Qt.SortOrder.AscendingOrder)
+        self._fill_countries()
+        self._apply_filter()
+        self._select_current_proxy()
+
+    def _select_current_proxy(self):
+        target = self._url_key(self._proxy)
+        if not target:
+            return
+        self.table.clearSelection()
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if data and self._url_key(data) == target:
+                if not self.table.isRowHidden(row):
+                    self.table.selectRow(row)
+                    self.table.scrollToItem(
+                        item,
+                        QAbstractItemView.ScrollHint.PositionAtCenter,
+                    )
+                return
+
+    def _accept_selected(self):
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return
+        item = self.table.item(rows[0].row(), 0)
+        if item is None:
+            return
+        url = item.data(Qt.ItemDataRole.UserRole)
+        if not url:
+            return
+        self.selected_proxy = str(url)
+        super().accept()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, settings: QSettings, parent=None):
         super().__init__(parent)
@@ -1506,7 +1857,7 @@ class SettingsDialog(QDialog):
         self._check_worker = None
         self.setWindowTitle("Настройки")
         self.setModal(True)
-        self.resize(700, 510)
+        self.resize(740, 520)
 
         root = QVBoxLayout(self)
         grid = QGridLayout()
@@ -1527,6 +1878,17 @@ class SettingsDialog(QDialog):
             "Поддерживаются http://, https://, socks4://, socks4a://, "
             "socks5:// и socks5h://. TLS-сертификаты не проверяются."
         )
+
+        self.proxy_hideip_btn = QPushButton("от hideip.me")
+        self.proxy_hideip_btn.setIcon(themed_icon(
+            self,
+            ("network-server", "network-server-symbolic", "download"),
+            QStyle.StandardPixmap.SP_DriveNetIcon,
+        ))
+        self.proxy_hideip_btn.setToolTip(
+            "Выбрать HTTPS-прокси из таблицы hideip.me"
+        )
+        self.proxy_hideip_btn.clicked.connect(self._open_hideip)
 
         self.quality_label = QLabel("Макс. качество:")
         self.quality_combo = QComboBox()
@@ -1592,7 +1954,8 @@ class SettingsDialog(QDialog):
         grid.addWidget(self.base_label, 0, 0)
         grid.addWidget(self.base_edit, 0, 1, 1, 2)
         grid.addWidget(self.proxy_check, 1, 0)
-        grid.addWidget(self.proxy_edit, 1, 1, 1, 2)
+        grid.addWidget(self.proxy_edit, 1, 1)
+        grid.addWidget(self.proxy_hideip_btn, 1, 2)
         grid.addWidget(self.quality_label, 2, 0)
         grid.addWidget(self.quality_combo, 2, 1)
         grid.addWidget(self.source_label, 3, 0)
@@ -1724,6 +2087,19 @@ class SettingsDialog(QDialog):
             self.autoplay_check.isChecked()
         )
 
+    def _open_hideip(self):
+        proxy = None
+        if self.proxy_check.isChecked():
+            proxy = normalize_proxy(self.proxy_edit.text())
+        dialog = HideIPDialog(proxy, self)
+        if (
+            dialog.exec() == QDialog.DialogCode.Accepted
+            and dialog.selected_proxy
+        ):
+            self.proxy_edit.setText(dialog.selected_proxy)
+            self.proxy_edit.setCursorPosition(0)
+            self.proxy_check.setChecked(True)
+
     def exec(self):
         self._load()
         return super().exec()
@@ -1818,6 +2194,295 @@ class SettingsDialog(QDialog):
         )
 
 
+class PosterDialog(QDialog):
+    """Немодальный просмотр полного постера."""
+
+    def __init__(self, owner, parent=None):
+        super().__init__(parent or owner)
+        self.owner = owner
+        self._url = ""
+        self._title = ""
+        self._data = b""
+        self._pixmap = None
+        self._preview = None
+        self._pending_action = ""
+        self._worker = None
+
+        self.setWindowTitle("Постер")
+        self.setWindowModality(Qt.WindowModality.NonModal)
+        self.setModal(False)
+        width, height = 720, 900
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            width = min(width, max(360, avail.width() - 60))
+            height = min(height, max(420, avail.height() - 80))
+        self.resize(width, height)
+        self.setStyleSheet(
+            "QDialog { background:#151515; }"
+            "QLabel { color:#dddddd; }"
+            "QPushButton { padding:6px 10px; }"
+        )
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label.setMinimumSize(300, 300)
+        self.image_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        self.image_label.setStyleSheet("background:#050505;")
+        root.addWidget(self.image_label, 1)
+
+        self.status = QLabel("")
+        self.status.setWordWrap(True)
+        self.status.setStyleSheet("color:#999; font-size:11px;")
+        root.addWidget(self.status)
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(6)
+        self.copy_image_btn = QPushButton("Копировать изображение")
+        self.copy_image_btn.setIcon(themed_icon(
+            self, ("edit-copy", "edit-copy-symbolic"),
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+        ))
+        self.copy_image_btn.setEnabled(False)
+        self.copy_image_btn.clicked.connect(self._copy_image)
+        self.copy_link_btn = QPushButton("Копировать ссылку")
+        self.copy_link_btn.setIcon(themed_icon(
+            self, ("edit-copy-link", "insert-link"),
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+        ))
+        self.copy_link_btn.setEnabled(False)
+        self.copy_link_btn.clicked.connect(self._copy_link)
+        self.save_btn = QPushButton("Сохранить как…")
+        self.save_btn.setIcon(themed_icon(
+            self, ("document-save", "document-save-symbolic"),
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+        ))
+        self.save_btn.setEnabled(False)
+        self.save_btn.clicked.connect(self._save)
+        self.close_btn = QPushButton("Закрыть")
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.copy_image_btn)
+        buttons.addWidget(self.copy_link_btn)
+        buttons.addWidget(self.save_btn)
+        buttons.addStretch(1)
+        buttons.addWidget(self.close_btn)
+        root.addLayout(buttons)
+
+        self._copy_shortcut = QShortcut(QKeySequence("Ctrl+C"), self)
+        self._copy_shortcut.activated.connect(self._copy_image)
+        self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self._save_shortcut.activated.connect(self._save)
+
+    def load(self, title: str, url: str, preview=None):
+        self._title = title or ""
+        self._url = url or ""
+        self._data = b""
+        self._pixmap = None
+        self._preview = preview
+        self._pending_action = ""
+        self.setWindowTitle(
+            "Постер — " + self._title if self._title else "Постер"
+        )
+        self.image_label.clear()
+        self.copy_image_btn.setEnabled(False)
+        self.save_btn.setEnabled(False)
+        self.copy_link_btn.setEnabled(bool(self._url))
+        if not self._url:
+            self.status.setText("Постер отсутствует")
+            return
+        cached = self.owner._poster_raw_cache.get(self._url)
+        if cached:
+            self._set_data(cached)
+            return
+        if preview is not None and not preview.isNull():
+            self._render_preview()
+        self.status.setText("Загрузка полного постера…")
+        worker = PosterWorker(
+            self._url,
+            self.owner._client_proxy(),
+            self.owner.client.base + "/",
+            self,
+        )
+        self._worker = worker
+        self.owner._track_worker(worker)
+        worker.done.connect(self._on_data)
+        worker.start()
+
+    def _render_preview(self):
+        if self._preview is None or self._preview.isNull():
+            return
+        target = self.image_label.size()
+        if target.width() > 0 and target.height() > 0:
+            self.image_label.setPixmap(
+                self._preview.scaled(
+                    target,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+
+    def _on_data(self, url: str, data: bytes):
+        if url != self._url:
+            return
+        self._worker = None
+        if not data:
+            self.status.setText("Не удалось загрузить постер")
+            return
+        self.owner._remember_poster_raw(url, data)
+        self._set_data(data)
+        if self._pending_action == "copy":
+            self._pending_action = ""
+            self._copy_image()
+        elif self._pending_action == "save":
+            self._pending_action = ""
+            self._save()
+
+    def _set_data(self, data: bytes):
+        pix = QPixmap()
+        ok = pix.loadFromData(data) and not pix.isNull()
+        if not ok:
+            try:
+                from PIL import Image
+
+                im = Image.open(io.BytesIO(data)).convert("RGBA")
+                buf = io.BytesIO()
+                im.save(buf, "PNG")
+                pix = QPixmap()
+                ok = pix.loadFromData(buf.getvalue()) and not pix.isNull()
+            except Exception:
+                ok = False
+        if not ok:
+            self.status.setText("Не удалось декодировать постер")
+            return
+        self._data = data
+        self._pixmap = pix
+        self.copy_image_btn.setEnabled(True)
+        self.save_btn.setEnabled(True)
+        self.status.setText(
+            f"Полный размер: {pix.width()}×{pix.height()}"
+            f" · {self._format_size(len(data))}"
+        )
+        self._update_image()
+
+    @staticmethod
+    def _format_size(size: int) -> str:
+        value = float(size or 0)
+        for unit in ("Б", "КБ", "МБ", "ГБ"):
+            if value < 1024 or unit == "ГБ":
+                if unit == "Б":
+                    return f"{int(value)} {unit}"
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{value:.1f} ГБ"
+
+    def _update_image(self):
+        pix = self._pixmap
+        if pix is None or pix.isNull():
+            self._render_preview()
+            return
+        target = self.image_label.size()
+        if target.width() <= 0 or target.height() <= 0:
+            return
+        self.image_label.setPixmap(
+            pix.scaled(
+                target,
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_image()
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(event)
+
+    def request_copy_image(self):
+        if self._pixmap is not None:
+            self._copy_image()
+        else:
+            self._pending_action = "copy"
+
+    def request_save(self):
+        if self._data:
+            self._save()
+        else:
+            self._pending_action = "save"
+
+    def _copy_image(self):
+        if self._pixmap is None or self._pixmap.isNull():
+            self._pending_action = "copy"
+            self.status.setText("Постер ещё загружается…")
+            return
+        QApplication.clipboard().setPixmap(self._pixmap)
+        self.status.setText("Изображение скопировано в буфер обмена")
+
+    def _copy_link(self):
+        if not self._url:
+            return
+        QApplication.clipboard().setText(self._url)
+        self.status.setText("Ссылка на постер скопирована")
+
+    @staticmethod
+    def _url_suffix(url: str) -> str:
+        suffix = os.path.splitext(
+            urllib.parse.urlparse(url or "").path
+        )[1].lower()
+        if suffix not in (".jpg", ".jpeg", ".png", ".webp"):
+            return ".jpg"
+        return suffix
+
+    @staticmethod
+    def _safe_name(title: str) -> str:
+        name = re.sub(r'[\\/:*?"<>|\x00-\x1f]+', "_", title or "").strip()
+        return (name or "poster")[:120]
+
+    def _save(self):
+        if not self._data or self._pixmap is None:
+            self._pending_action = "save"
+            self.status.setText("Постер ещё загружается…")
+            return
+        suffix = self._url_suffix(self._url)
+        default = os.path.join(
+            os.path.expanduser("~"),
+            self._safe_name(self._title) + suffix,
+        )
+        path, _selected = QFileDialog.getSaveFileName(
+            self,
+            "Сохранить постер",
+            default,
+            "Изображения (*.jpg *.jpeg *.png *.webp);;Все файлы (*)",
+        )
+        if not path:
+            self._pending_action = ""
+            return
+        chosen = os.path.splitext(path)[1].lower()
+        raw_ok = (
+            chosen == suffix
+            or (chosen in (".jpg", ".jpeg") and suffix in (".jpg", ".jpeg"))
+        )
+        try:
+            if raw_ok:
+                with open(path, "wb") as fh:
+                    fh.write(self._data)
+            else:
+                if not self._pixmap.save(path):
+                    raise OSError("не удалось сохранить изображение")
+            self.status.setText("Сохранено: " + path)
+        except OSError as e:
+            self.status.setText("Ошибка сохранения: " + str(e))
+        self._pending_action = ""
+
+
 # --------------------------------------------------------------------------
 # Главное окно
 # --------------------------------------------------------------------------
@@ -1908,9 +2573,14 @@ class MainWindow(QMainWindow):
         self._catalog_worker = None
         self._title_worker = None
         self._search_worker = None
+        self._person_worker = None
+        self._person_filter = None
+        self._person_token = 0
 
         self._poster_cache: Dict[str, QPixmap] = {}
+        self._poster_raw_cache: Dict[str, bytes] = {}
         self._poster_url = ""
+        self._poster_dialog = None
 
         self._fullscreen = False
         self._fs_t = 0.0
@@ -2293,6 +2963,26 @@ class MainWindow(QMainWindow):
         list_layout = QVBoxLayout(self.list_box)
         list_layout.setContentsMargins(0, 0, 0, 0)
         list_layout.setSpacing(4)
+        self.person_bar = QWidget()
+        person_row = QHBoxLayout(self.person_bar)
+        person_row.setContentsMargins(0, 0, 0, 0)
+        person_row.setSpacing(4)
+        self.person_label = QLabel("")
+        self.person_label.setWordWrap(True)
+        self.person_label.setStyleSheet(
+            "color:#555; font-size:11px; font-weight:600;"
+        )
+        self.person_reset_btn = QPushButton("Сбросить")
+        self.person_reset_btn.setIcon(themed_icon(
+            self, ("edit-undo", "edit-undo-symbolic"),
+            QStyle.StandardPixmap.SP_DialogResetButton,
+        ))
+        self.person_reset_btn.setToolTip("Вернуться к каталогу")
+        self.person_reset_btn.clicked.connect(self._clear_person_filter)
+        person_row.addWidget(self.person_label, 1)
+        person_row.addWidget(self.person_reset_btn)
+        self.person_bar.setVisible(False)
+        list_layout.addWidget(self.person_bar)
         list_layout.addWidget(self.list, 1)
         bottom_row = QHBoxLayout()
         bottom_row.setContentsMargins(0, 0, 0, 0)
@@ -2318,9 +3008,18 @@ class MainWindow(QMainWindow):
 
         header = QHBoxLayout()
         header.setSpacing(10)
-        self.poster_label = QLabel()
+        self.poster_label = ClickableLabel()
         self.poster_label.setFixedSize(112, 160)
         self.poster_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.poster_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.poster_label.setToolTip("Открыть постер в полном размере")
+        self.poster_label.clicked.connect(self._open_poster)
+        self.poster_label.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.CustomContextMenu
+        )
+        self.poster_label.customContextMenuRequested.connect(
+            self._poster_context_menu
+        )
         self._set_poster_placeholder("HDrezka")
         header.addWidget(
             self.poster_label, 0, Qt.AlignmentFlag.AlignTop
@@ -2340,9 +3039,23 @@ class MainWindow(QMainWindow):
         self.rating_label.setStyleSheet(
             "color:#b16286; font-weight:600;"
         )
+        self.director_label = QLabel("")
+        self.director_label.setWordWrap(True)
+        self.director_label.setTextFormat(Qt.TextFormat.RichText)
+        self.director_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self.director_label.setOpenExternalLinks(False)
+        self.director_label.setStyleSheet(
+            "QLabel { color:#555; font-size:11px; }"
+        )
+        self.director_label.linkActivated.connect(self._on_person_link)
+        self.director_label.setVisible(False)
         text_col.addWidget(self.title_label)
         text_col.addWidget(self.meta_label)
         text_col.addWidget(self.rating_label)
+        text_col.addWidget(self.director_label)
         text_col.addStretch(1)
         header.addLayout(text_col, 1)
 
@@ -2357,6 +3070,21 @@ class MainWindow(QMainWindow):
         self.fav_btn.setVisible(False)
         header.addWidget(self.fav_btn, 0, Qt.AlignmentFlag.AlignTop)
         info.addLayout(header)
+
+        self.actors_label = QLabel("")
+        self.actors_label.setWordWrap(True)
+        self.actors_label.setTextFormat(Qt.TextFormat.RichText)
+        self.actors_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.LinksAccessibleByMouse
+            | Qt.TextInteractionFlag.LinksAccessibleByKeyboard
+        )
+        self.actors_label.setOpenExternalLinks(False)
+        self.actors_label.setStyleSheet(
+            "QLabel { color:#555; font-size:11px; }"
+        )
+        self.actors_label.linkActivated.connect(self._on_person_link)
+        self.actors_label.setVisible(False)
+        info.addWidget(self.actors_label)
 
         self.desc = QTextEdit()
         self.desc.setReadOnly(True)
@@ -3084,6 +3812,147 @@ class MainWindow(QMainWindow):
             return
         self.leave_fullscreen()
 
+    # ---------- актёры/режиссёры ----------
+    @staticmethod
+    def _person_role_label(role: str) -> str:
+        return "Режиссёр" if role == "rezhisser" else "В ролях"
+
+    def _person_link(self, role: str, url: str, name: str) -> str:
+        quoted = urllib.parse.quote(url or "", safe="")
+        label = html_module.escape(name or url or "")
+        return (
+            f'<a href="person:{role}:{quoted}" '
+            f'style="color:#2a6f9e; text-decoration:none;">{label}</a>'
+        )
+
+    def _person_name(self, role: str, url: str) -> str:
+        info = self._title_info
+        if info is None:
+            return url
+        people = info.directors if role == "rezhisser" else info.actors
+        for name, person_url in people or []:
+            if person_url == url:
+                return name
+        return url
+
+    def _render_people(self):
+        info = self._title_info
+        if info is None:
+            self.director_label.setVisible(False)
+            self.actors_label.setVisible(False)
+            return
+
+        directors = list(info.directors or [])
+        if directors:
+            links = ", ".join(
+                self._person_link("rezhisser", url, name)
+                for name, url in directors
+            )
+            self.director_label.setText("Режиссёр: " + links)
+            self.director_label.setVisible(True)
+        else:
+            self.director_label.setVisible(False)
+
+        actors = list(info.actors or [])
+        if not actors:
+            self.actors_label.setVisible(False)
+            return
+
+        links = ", ".join(
+            self._person_link("akter", url, name)
+            for name, url in actors
+        )
+        self.actors_label.setText("В ролях: " + links)
+        self.actors_label.setVisible(True)
+
+    def _on_person_link(self, link: str):
+        if not link.startswith("person:"):
+            return
+        try:
+            _prefix, role, quoted = link.split(":", 2)
+            url = urllib.parse.unquote(quoted)
+        except ValueError:
+            return
+        if role not in ("akter", "rezhisser"):
+            return
+        name = self._person_name(role, url)
+        self._start_person_filter(role, name, url)
+
+    def _start_person_filter(self, role: str, name: str, url: str):
+        if not url:
+            return
+        if self.search.text():
+            self.search.blockSignals(True)
+            self.search.clear()
+            self.search.blockSignals(False)
+            self._search_timer.stop()
+            self._search_active = False
+            self._search_token += 1
+        self._person_filter = {"role": role, "name": name, "url": url}
+        self._person_token += 1
+        token = self._person_token
+        self._catalog_token += 1
+        self._catalog_worker = None
+        self._has_more = False
+        self.more_btn.setVisible(False)
+        self.more_btn.setEnabled(False)
+        self.genre_combo.setEnabled(False)
+        self.year_combo.setEnabled(False)
+        self.rating_combo.setEnabled(False)
+        label = self._person_role_label(role)
+        self.person_label.setText(f"{label}: {name} — загрузка…")
+        self.person_bar.setVisible(True)
+        self.statusBar().showMessage(f"Загрузка фильмографии: {name}…")
+        worker = PersonWorker(self.client, url, role, token, self)
+        self._person_worker = worker
+        self._track_worker(worker)
+        worker.done.connect(self._on_person_done)
+        worker.start()
+
+    def _on_person_done(self, token: int, result: dict):
+        if token != self._person_token:
+            return
+        self._person_worker = None
+        flt = self._person_filter or {}
+        role = str(flt.get("role") or "akter")
+        name = str(flt.get("name") or "")
+        label = self._person_role_label(role)
+        err = (result or {}).get("error") or ""
+        if err:
+            self.person_label.setText(f"{label}: {name} — ошибка")
+            self.statusBar().showMessage(
+                "Не удалось загрузить фильмографию: " + err, 8000
+            )
+            return
+        items = (result or {}).get("items") or []
+        self.catalog_items = items
+        self._catalog_page = 1
+        self._has_more = False
+        self.more_btn.setVisible(False)
+        self.more_btn.setEnabled(False)
+        self.genre_combo.setEnabled(False)
+        self.year_combo.setEnabled(False)
+        self.rating_combo.setEnabled(False)
+        if self.search.text().strip():
+            self.person_label.setText(f"{label}: {name} ({len(items)})")
+            return
+        self.list.blockSignals(True)
+        try:
+            self._populate_list(items)
+        finally:
+            self.list.blockSignals(False)
+        self.person_label.setText(f"{label}: {name} ({len(items)})")
+        self.person_bar.setVisible(True)
+        self.statusBar().showMessage(
+            f"{label}: {name} — {len(items)} тайтлов", 8000
+        )
+
+    def _clear_person_filter(self):
+        self._person_filter = None
+        self._person_token += 1
+        self.person_bar.setVisible(False)
+        self.refresh_catalog(reset=True)
+
     # ---------- избранное ----------
     @staticmethod
     def _read_json(path: str, default):
@@ -3231,7 +4100,11 @@ class MainWindow(QMainWindow):
             message = "Добавлено в избранное"
         self._update_fav_button()
         section = str(self.catalog_combo.currentData() or "")
-        if section == "favorites" and not self.search.text().strip():
+        if (
+            section == "favorites"
+            and not self.search.text().strip()
+            and not self._person_filter
+        ):
             self._render_favorites(start_meta=False)
         self.statusBar().showMessage(
             message + f": {info.title}", 6000
@@ -3291,7 +4164,11 @@ class MainWindow(QMainWindow):
                 "Добавьте фильм или сериал звёздочкой в правом верхнем углу"
             )
             self.rating_label.setText("")
+            self.director_label.setVisible(False)
+            self.actors_label.setVisible(False)
             self.desc.setPlainText("")
+            self._title_info = None
+            self._poster_url = ""
             self._set_poster_placeholder("★")
             self.play_btn.setEnabled(False)
             self.copy_btn.setEnabled(False)
@@ -3342,6 +4219,7 @@ class MainWindow(QMainWindow):
         if (
             str(self.catalog_combo.currentData() or "") == "favorites"
             and not self.search.text().strip()
+            and not self._person_filter
         ):
             self._render_favorites(start_meta=False)
 
@@ -3361,6 +4239,14 @@ class MainWindow(QMainWindow):
             return
         if self.search.text().strip():
             self._run_search()
+            return
+        if self._person_filter:
+            flt = dict(self._person_filter)
+            self._start_person_filter(
+                str(flt.get("role") or "akter"),
+                str(flt.get("name") or ""),
+                str(flt.get("url") or ""),
+            )
             return
         section = str(self.catalog_combo.currentData() or "home")
         if section == "favorites":
@@ -3547,6 +4433,8 @@ class MainWindow(QMainWindow):
             return
         if str(self.catalog_combo.currentData() or "") == "favorites":
             return
+        if self._person_filter:
+            return
         self.refresh_catalog(reset=False)
 
     def _on_catalog_changed(self):
@@ -3558,6 +4446,9 @@ class MainWindow(QMainWindow):
             self.search.blockSignals(False)
         self._search_active = False
         self._search_token += 1          # отменяем возможный старый поиск
+        self._person_filter = None
+        self._person_token += 1
+        self.person_bar.setVisible(False)
         self._catalog_genre = ""
         self._catalog_year = ""
         self._catalog_rating = ""
@@ -3593,10 +4484,17 @@ class MainWindow(QMainWindow):
             self._update_rating_enabled(section)
             if section == "favorites":
                 self.more_btn.setVisible(False)
+            if self._person_filter:
+                self.person_bar.setVisible(True)
+                self.genre_combo.setEnabled(False)
+                self.year_combo.setEnabled(False)
+                self.rating_combo.setEnabled(False)
+                self.more_btn.setVisible(False)
             return
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
         self.rating_combo.setEnabled(False)
+        self.person_bar.setVisible(False)
         self.more_btn.setVisible(False)
         self._search_timer.start()
 
@@ -3609,6 +4507,7 @@ class MainWindow(QMainWindow):
         self._search_active = True
         self.more_btn.setEnabled(False)
         self.more_btn.setVisible(False)
+        self.person_bar.setVisible(False)
         self.refresh_btn.setEnabled(False)
         self.statusBar().showMessage(f"Поиск: {query}…")
         worker = SearchWorker(self.client, query, token, self)
@@ -3632,6 +4531,7 @@ class MainWindow(QMainWindow):
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
         self.rating_combo.setEnabled(False)
+        self.person_bar.setVisible(False)
         self.more_btn.setVisible(False)
         if items:
             self.statusBar().showMessage(
@@ -3759,6 +4659,11 @@ class MainWindow(QMainWindow):
 
     # ---------- тайтл ----------
     def _load_title(self, url: str):
+        if (
+            self._poster_dialog is not None
+            and self._poster_dialog.isVisible()
+        ):
+            self._poster_dialog.close()
         self.save_position()
         self._cancel_next_timer(quiet=True)
         self._resume_timer.stop()
@@ -3782,7 +4687,10 @@ class MainWindow(QMainWindow):
         self.title_label.setText("Загрузка…")
         self.meta_label.setText("")
         self.rating_label.setText("")
+        self.director_label.setVisible(False)
+        self.actors_label.setVisible(False)
         self.desc.setPlainText("")
+        self._poster_url = ""
         self._suppress_ui = True
         self.translation_combo.clear()
         self.season_combo.clear()
@@ -3845,6 +4753,7 @@ class MainWindow(QMainWindow):
     def _apply_title(self, info: core.TitleInfo):
         self._title_info = info
         self._update_fav_button()
+        self._render_people()
         if self._is_favorite(info.post_id):
             cache = self._load_favorites_cache()
             cache[str(info.post_id)] = self._favorite_meta_from_info(info)
@@ -3852,6 +4761,7 @@ class MainWindow(QMainWindow):
             if (
                 str(self.catalog_combo.currentData() or "") == "favorites"
                 and not self.search.text().strip()
+                and not self._person_filter
             ):
                 self._render_favorites(start_meta=False)
         if self._startup_resume_url and not self._is_startup_resume(info):
@@ -4614,9 +5524,18 @@ class MainWindow(QMainWindow):
         self._track_worker(worker)
         worker.start()
 
+    def _remember_poster_raw(self, url: str, data: bytes):
+        if not url or not data:
+            return
+        cache = self._poster_raw_cache
+        cache[url] = data
+        while len(cache) > 32:
+            cache.pop(next(iter(cache)))
+
     def _on_poster_data(self, url, data):
         if not data:
             return
+        self._remember_poster_raw(url, data)
         pix = QPixmap()
         ok = pix.loadFromData(data) and not pix.isNull()
         if not ok:
@@ -4636,6 +5555,75 @@ class MainWindow(QMainWindow):
             self._poster_cache[url] = pix
         if url == self._poster_url:
             self._apply_poster(pix)
+
+    def _poster_current_url(self) -> str:
+        info = self._title_info
+        if info is not None:
+            return (
+                info.poster_full or info.poster or self._poster_url or ""
+            )
+        return self._poster_url or ""
+
+    def _open_poster(self, copy: bool = False, save: bool = False):
+        info = self._title_info
+        url = self._poster_current_url()
+        if not url:
+            self.statusBar().showMessage("Постер отсутствует", 5000)
+            return None
+        if self._poster_dialog is None:
+            self._poster_dialog = PosterDialog(self, self)
+        dialog = self._poster_dialog
+        if dialog._url == url:
+            dialog.show()
+            dialog.raise_()
+            dialog.activateWindow()
+            if copy:
+                dialog.request_copy_image()
+            if save:
+                dialog.request_save()
+            return dialog
+        preview = self._poster_cache.get(info.poster if info else url)
+        dialog.load(
+            info.title if info is not None else "",
+            url,
+            preview,
+        )
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        if copy:
+            dialog.request_copy_image()
+        if save:
+            dialog.request_save()
+        return dialog
+
+    def _copy_poster_link(self):
+        url = self._poster_current_url()
+        if not url:
+            self.statusBar().showMessage("Постер отсутствует", 5000)
+            return
+        QApplication.clipboard().setText(url)
+        self.statusBar().showMessage(
+            "Ссылка на постер скопирована", 5000
+        )
+
+    def _poster_context_menu(self, pos):
+        if not self._poster_current_url():
+            return
+        menu = QMenu(self)
+        open_action = menu.addAction("Открыть постер")
+        copy_image_action = menu.addAction("Копировать изображение")
+        copy_link_action = menu.addAction("Копировать ссылку")
+        save_action = menu.addAction("Сохранить как…")
+        chosen = menu.exec(self.poster_label.mapToGlobal(pos))
+        if chosen is open_action:
+            self._open_poster()
+        elif chosen is copy_image_action:
+            self._open_poster(copy=True)
+        elif chosen is copy_link_action:
+            self._copy_poster_link()
+        elif chosen is save_action:
+            self._open_poster(save=True)
 
     # ---------- панели/полный экран ----------
     def _focus_search(self):
@@ -4903,6 +5891,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._hide_overlay()
+        if self._poster_dialog is not None:
+            self._poster_dialog.close()
+            self._poster_dialog = None
         self.settings.setValue("geometry", self.saveGeometry())
         self.settings.setValue("splitter_state", self.splitter.saveState())
         self.settings.setValue("last_url", self._current_url)

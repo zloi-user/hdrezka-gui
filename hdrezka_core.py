@@ -135,6 +135,7 @@ class TitleInfo:
     original_title: str = ""
     description: str = ""
     poster: str = ""
+    poster_full: str = ""
     kind: str = ""
     year: str = ""
     country: str = ""
@@ -144,6 +145,8 @@ class TitleInfo:
     quality: str = ""
     info: Dict[str, str] = field(default_factory=dict)
     translators: List[Translator] = field(default_factory=list)
+    actors: List[Tuple[str, str]] = field(default_factory=list)
+    directors: List[Tuple[str, str]] = field(default_factory=list)
     seasons: Dict[str, str] = field(default_factory=dict)
     episodes: Dict[str, List[Episode]] = field(default_factory=dict)
     is_series: bool = False
@@ -298,10 +301,20 @@ def parse_search_html(text: str, base: str) -> List[SearchItem]:
     return items
 
 
-def parse_catalog_html(text: str, base: str) -> List[SearchItem]:
+def parse_catalog_html(
+    text: str, base: str, include_hidden: bool = False
+) -> List[SearchItem]:
     items: List[SearchItem] = []
     seen = set()
-    chunks = (text or "").split('<div class="b-content__inline_item"')[1:]
+    if include_hidden:
+        chunks = re.split(
+            r'<div class="b-content__inline_item(?:\s+[^"]*)?"',
+            text or "",
+        )[1:]
+    else:
+        chunks = (text or "").split(
+            '<div class="b-content__inline_item"'
+        )[1:]
     for chunk in chunks:
         url_m = re.search(r'data-url="([^"]+)"', chunk)
         if not url_m:
@@ -499,6 +512,38 @@ def _parse_translators(
     return result
 
 
+def _parse_person_links(
+    text: str, prop: str, base: str
+) -> List[Tuple[str, str]]:
+    """Ссылки на персон: [(имя, абсолютный URL), ...]."""
+    result: List[Tuple[str, str]] = []
+    seen = set()
+    for m in re.finditer(
+        r'<span class="person-name-item"[^>]*>', text or ""
+    ):
+        tag = m.group(0)
+        if f'itemprop="{prop}"' not in tag:
+            continue
+        tail = (text or "")[m.end():m.end() + 2500]
+        link_m = re.search(
+            r'<a[^>]+href="([^"]*?/person/[^"]+)"[^>]*>', tail
+        )
+        if not link_m:
+            continue
+        url = absolute(base, link_m.group(1))
+        if url in seen:
+            continue
+        name_m = re.search(
+            r'<span itemprop="name">(.*?)</span>', tail, re.S
+        )
+        name = clean_text(name_m.group(1)) if name_m else ""
+        if not name:
+            name = clean_text(link_m.group(0)) or url
+        seen.add(url)
+        result.append((name, url))
+    return result
+
+
 def _parse_seasons_html(text: str) -> Dict[str, str]:
     seasons: Dict[str, str] = {}
     for m in re.finditer(
@@ -617,10 +662,24 @@ def parse_title_html(text: str, url: str, base: str) -> TitleInfo:
     if poster_m:
         poster = absolute(base, poster_m.group(1))
 
+    poster_full = ""
+    for link_m in re.finditer(r'<a([^>]+)>', text or ""):
+        attrs = link_m.group(1)
+        if 'data-imagelightbox="cover"' not in attrs:
+            continue
+        href_m = re.search(r'href="([^"]+)"', attrs)
+        if href_m:
+            poster_full = absolute(base, href_m.group(1))
+        break
+    if not poster_full:
+        poster_full = poster
+
     info = _parse_info_table(text)
     init = _parse_init_events(text) or {}
     default_tid = str(init.get("translator_id") or "")
     translators = _parse_translators(text, default_tid, info)
+    actors = _parse_person_links(text, "actor", base)
+    directors = _parse_person_links(text, "director", base)
     seasons = _parse_seasons_html(text)
     episodes = _parse_episodes_html(text)
     is_series = bool(init.get("is_series")) or bool(seasons or episodes)
@@ -677,6 +736,7 @@ def parse_title_html(text: str, url: str, base: str) -> TitleInfo:
         original_title=original,
         description=description,
         poster=poster,
+        poster_full=poster_full,
         kind=kind_from_url(url),
         year=year,
         country=info.get("Страна", ""),
@@ -686,6 +746,8 @@ def parse_title_html(text: str, url: str, base: str) -> TitleInfo:
         quality=info.get("В качестве", ""),
         info=info,
         translators=translators,
+        actors=actors,
+        directors=directors,
         seasons=seasons,
         episodes=episodes,
         is_series=is_series,
@@ -1122,6 +1184,42 @@ class HDrezkaClient:
             return float(value)
         except (TypeError, ValueError):
             return 0.0
+
+    def fetch_person(
+        self, url: str, section: str = "akter"
+    ) -> List[SearchItem]:
+        """Фильмография персоны только из нужного раздела.
+
+        section: "akter" — актёр, "rezhisser" — режиссёр.
+        """
+        resp = self.request("GET", url)
+        if resp.status_code >= 400:
+            raise HDrezkaError(
+                f"HTTP {resp.status_code} при загрузке персоны"
+            )
+        text = resp.text or ""
+        sections = [section]
+        if section == "akter":
+            # На странице актрисы раздел называется #aktrisa.
+            sections.append("aktrisa")
+        parts = re.split(
+            r'(?=<div class="b-person__career">)', text
+        )
+        for target_section in sections:
+            block = ""
+            for part in parts:
+                m = re.search(r'<h2 id="([^"]+)"', part)
+                if m and m.group(1) == target_section:
+                    block = part
+                    break
+            if not block:
+                continue
+            items = parse_catalog_html(
+                block, self.base, include_hidden=True
+            )
+            if items:
+                return items
+        return []
 
     def search(self, query: str) -> List[SearchItem]:
         query = (query or "").strip()
