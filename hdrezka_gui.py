@@ -5458,6 +5458,41 @@ class MainWindow(QMainWindow):
             msg += " · есть ещё"
         self.statusBar().showMessage(msg, 6000)
 
+    def _filter_disabled_reason(self, section: str) -> str:
+        if self.search.text().strip():
+            return "во время поиска"
+        if section == "home":
+            return "для «Новинок»"
+        if section == "favorites":
+            return "для «Избранного»"
+        if section == "show":
+            return "для «ТВ-шоу»"
+        return "для этого раздела"
+
+    def _genre_tooltip(self, section: str, enabled: bool) -> str:
+        if enabled:
+            return "Фильтр по жанру для текущего раздела."
+        if (
+            not self.search.text().strip()
+            and section not in ("home", "favorites")
+            and self.genre_combo.count() <= 1
+        ):
+            return "Для этого раздела нет доступных жанров."
+        return "Жанры недоступны " + self._filter_disabled_reason(section) + "."
+
+    def _year_tooltip(self, section: str, enabled: bool) -> str:
+        if enabled:
+            return "Фильтр по году выпуска (подборки «Лучшее»)."
+        return "Год недоступен " + self._filter_disabled_reason(section) + "."
+
+    def _rating_tooltip(self, section: str, enabled: bool) -> str:
+        if enabled:
+            return "Минимальный рейтинг HDrezka (подборки «Лучшее»)."
+        return (
+            "Рейтинг недоступен "
+            + self._filter_disabled_reason(section) + "."
+        )
+
     def _update_genres(self, genres, section: str):
         current = self._catalog_genre
         current_text = self.genre_combo.currentText() if current else ""
@@ -5484,6 +5519,9 @@ class MainWindow(QMainWindow):
             and not self.search.text().strip()
         )
         self.genre_combo.setEnabled(enabled)
+        self.genre_combo.setToolTip(
+            self._genre_tooltip(section, enabled)
+        )
         self._suppress_ui = False
 
     def _on_genre_changed(self):
@@ -5502,6 +5540,9 @@ class MainWindow(QMainWindow):
         )
         self._suppress_ui = True
         self.year_combo.setEnabled(enabled)
+        self.year_combo.setToolTip(
+            self._year_tooltip(section, enabled)
+        )
         if not enabled and self.year_combo.currentIndex() != 0:
             self.year_combo.setCurrentIndex(0)
             self._catalog_year = ""
@@ -5523,6 +5564,9 @@ class MainWindow(QMainWindow):
         )
         self._suppress_ui = True
         self.rating_combo.setEnabled(enabled)
+        self.rating_combo.setToolTip(
+            self._rating_tooltip(section, enabled)
+        )
         if not enabled and self.rating_combo.currentIndex() != 0:
             self.rating_combo.setCurrentIndex(0)
             self._catalog_rating = ""
@@ -5576,6 +5620,17 @@ class MainWindow(QMainWindow):
         self.year_combo.setEnabled(False)
         self.rating_combo.setCurrentIndex(0)
         self.rating_combo.setEnabled(False)
+        section = str(self.catalog_combo.currentData() or "home")
+        if section in ("home", "favorites", "show"):
+            self.genre_combo.setToolTip(
+                self._genre_tooltip(section, False)
+            )
+            self.year_combo.setToolTip(
+                self._year_tooltip(section, False)
+            )
+            self.rating_combo.setToolTip(
+                self._rating_tooltip(section, False)
+            )
         self._suppress_ui = False
         self.refresh_catalog(reset=True)
 
@@ -5589,9 +5644,13 @@ class MainWindow(QMainWindow):
             self.more_btn.setEnabled(self._has_more)
             self.more_btn.setVisible(self._has_more)
             section = str(self.catalog_combo.currentData() or "home")
-            self.genre_combo.setEnabled(
+            genre_enabled = (
                 section not in ("home", "favorites")
                 and self.genre_combo.count() > 1
+            )
+            self.genre_combo.setEnabled(genre_enabled)
+            self.genre_combo.setToolTip(
+                self._genre_tooltip(section, genre_enabled)
             )
             self._update_year_enabled(section)
             self._update_rating_enabled(section)
@@ -5602,11 +5661,19 @@ class MainWindow(QMainWindow):
                 self.genre_combo.setEnabled(False)
                 self.year_combo.setEnabled(False)
                 self.rating_combo.setEnabled(False)
+                person_tip = "Недоступно при фильтре по персоне."
+                self.genre_combo.setToolTip(person_tip)
+                self.year_combo.setToolTip(person_tip)
+                self.rating_combo.setToolTip(person_tip)
                 self.more_btn.setVisible(False)
             return
+        search_tip = "Недоступно во время поиска."
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
         self.rating_combo.setEnabled(False)
+        self.genre_combo.setToolTip(search_tip)
+        self.year_combo.setToolTip(search_tip)
+        self.rating_combo.setToolTip(search_tip)
         self.person_bar.setVisible(False)
         self.more_btn.setVisible(False)
         self._search_timer.start()
@@ -5641,9 +5708,13 @@ class MainWindow(QMainWindow):
         items = (result or {}).get("items") or []
         query = (result or {}).get("query") or ""
         self._populate_list(items, select_url="")
+        search_tip = "Недоступно во время поиска."
         self.genre_combo.setEnabled(False)
         self.year_combo.setEnabled(False)
         self.rating_combo.setEnabled(False)
+        self.genre_combo.setToolTip(search_tip)
+        self.year_combo.setToolTip(search_tip)
+        self.rating_combo.setToolTip(search_tip)
         self.person_bar.setVisible(False)
         self.more_btn.setVisible(False)
         if items:

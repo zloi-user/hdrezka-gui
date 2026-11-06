@@ -217,6 +217,14 @@ QComboBox QAbstractItemView {{
     selection-background-color: {t.highlight};
     selection-color: {t.highlight_text};
 }}
+QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{
+    background: {t.alt};
+    color: {t.disabled};
+    border: 1px dashed {t.disabled};
+}}
+QPushButton:disabled {{
+    color: {t.disabled};
+}}
 QPushButton {{
     background: {t.button_bg};
     color: {t.text};
