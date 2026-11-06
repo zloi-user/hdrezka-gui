@@ -36,6 +36,7 @@ import signal
 import subprocess
 import sys
 import threading
+import textwrap
 import time
 import traceback
 import urllib.parse
@@ -52,12 +53,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
     from PyQt6.QtCore import (
-        QObject, QPointF, QSettings, QSize, QStandardPaths, Qt, QThread,
-        QTimer, pyqtSignal,
+        QEvent, QObject, QPointF, QRect, QSettings, QSize,
+        QStandardPaths, Qt,
+        QThread, QTimer, pyqtSignal,
     )
     from PyQt6.QtGui import (
-        QBrush, QColor, QCursor, QIcon, QKeySequence, QOpenGLContext,
-        QPainter, QPen, QPixmap, QPolygonF, QShortcut,
+        QBrush, QColor, QCursor, QFont, QFontMetrics, QIcon,
+        QKeySequence, QOpenGLContext, QPainter, QPalette, QPen, QPixmap,
+        QPolygonF, QShortcut,
     )
     from PyQt6.QtOpenGLWidgets import QOpenGLWidget
     from PyQt6.QtWidgets import (
@@ -65,14 +68,16 @@ try:
         QDialogButtonBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
         QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
         QPushButton, QSizePolicy, QSplitter, QSpinBox, QStyle,
-        QTableWidget, QTableWidgetItem, QTextEdit, QTreeWidget,
-        QTreeWidgetItem, QVBoxLayout, QWidget,
+        QStyledItemDelegate, QStyleOptionViewItem, QTableWidget,
+        QTableWidgetItem, QTextEdit,
+        QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
     )
 except ImportError:  # pragma: no cover
     sys.exit("Не найден PyQt6. Установите: python3 -m pip install PyQt6")
 
 import hdrezka_core as core
 import proxy_scanner as proxy_scan
+import themes as app_theme
 from proxy_bridge import ProxyBridge
 from screen_inhibitor import ScreenInhibitor
 
@@ -81,6 +86,21 @@ from screen_inhibitor import ScreenInhibitor
 # --------------------------------------------------------------------------
 
 APP_TITLE = "HDrezka"
+
+# Роли двухстрочного списка.
+LIST_TITLE_ROLE = 257
+LIST_META_ROLE = 258
+LIST_RATING_ROLE = 259
+LIST_GROUP_ROLE = 260
+
+# Заголовки групп в списке — во множественном числе.
+LIST_GROUP_TITLES = {
+    "Фильм": "Фильмы",
+    "Сериал": "Сериалы",
+    "Мультфильм": "Мультфильмы",
+    "Документальный": "Документальные",
+    "Другое": "Другие",
+}
 ORG_NAME = "hdrezka"
 APP_NAME = "hdrezka-gui"
 
@@ -256,35 +276,68 @@ def initials(name: str) -> str:
     return "?"
 
 
-def themed_icon(widget, theme_names, standard):
+def _tint_icon(icon: QIcon, color: str) -> QIcon:
+    """Перекрашивает монохромную иконку под текущую тему."""
+    if icon.isNull():
+        return icon
+    result = QIcon()
+    for size in (16, 20, 24, 32):
+        pix = icon.pixmap(QSize(size, size))
+        if pix.isNull():
+            continue
+        tinted = QPixmap(pix.size())
+        tinted.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(tinted)
+        try:
+            painter.drawPixmap(0, 0, pix)
+            painter.setCompositionMode(
+                QPainter.CompositionMode.CompositionMode_SourceIn
+            )
+            painter.fillRect(tinted.rect(), QColor(color))
+        finally:
+            painter.end()
+        result.addPixmap(tinted)
+    return result if not result.isNull() else icon
+
+
+def themed_icon(widget, theme_names, standard, color=None):
     """Иконка из темы с fallback на стандартную иконку Qt."""
+    icon = QIcon()
     for name in theme_names:
         try:
             icon = QIcon.fromTheme(name)
         except Exception:
             icon = QIcon()
         if not icon.isNull():
-            return icon
-    try:
-        return widget.style().standardIcon(standard)
-    except Exception:
-        return QIcon()
+            break
+    if icon.isNull():
+        try:
+            icon = widget.style().standardIcon(standard)
+        except Exception:
+            icon = QIcon()
+    if icon.isNull():
+        return icon
+    tint = color
+    if tint is None and app_theme.current_theme().key == "dark":
+        tint = app_theme.current_theme().text
+    return _tint_icon(icon, tint) if tint else icon
 
 
-def star_icon(filled: bool) -> QIcon:
+def star_icon(filled: bool, force_draw: bool = False) -> QIcon:
     """Звезда для кнопки избранного (тема или нарисованная)."""
     names = (
         ("starred", "starred-symbolic", "rating")
         if filled else
         ("non-starred", "non-starred-symbolic")
     )
-    for name in names:
-        try:
-            icon = QIcon.fromTheme(name)
-        except Exception:
-            icon = QIcon()
-        if not icon.isNull():
-            return icon
+    if not force_draw:
+        for name in names:
+            try:
+                icon = QIcon.fromTheme(name)
+            except Exception:
+                icon = QIcon()
+            if not icon.isNull():
+                return icon
 
     size = 20
     pix = QPixmap(size, size)
@@ -728,6 +781,177 @@ class ClickableLabel(QLabel):
         if event.button() == Qt.MouseButton.LeftButton:
             self.clicked.emit()
         super().mouseReleaseEvent(event)
+
+
+def list_fonts(base: QFont):
+    """Шрифты первой (название) и второй (год/жанр/рейтинг) строки."""
+    title = QFont(base)
+    title.setBold(True)
+    size = title.pointSizeF()
+    if size > 0:
+        title.setPointSizeF(min(22.0, size + 0.5))
+    meta = QFont(base)
+    size = meta.pointSizeF()
+    if size > 0:
+        meta.setPointSizeF(max(7.0, size - 0.5))
+    return title, meta
+
+
+class TwoLineItemDelegate(QStyledItemDelegate):
+    """Двухстрочная карточка списка: название + год/жанр/рейтинг."""
+
+    ROW_HEIGHT = 44
+    GROUP_HEIGHT = 27
+
+    def sizeHint(self, option, index):
+        if index.data(LIST_GROUP_ROLE):
+            return QSize(0, self.GROUP_HEIGHT)
+        return QSize(0, self.ROW_HEIGHT)
+
+    def paint(self, painter, option, index):
+        if index.data(LIST_GROUP_ROLE):
+            self._paint_group(painter, option, index)
+            return
+        self._paint_item(painter, option, index)
+
+    @staticmethod
+    def _paint_group(painter, option, index):
+        theme = app_theme.current_theme()
+        painter.save()
+        painter.setClipRect(option.rect)
+        painter.fillRect(option.rect, QColor(theme.group_bg))
+        painter.setPen(QColor(theme.group_border))
+        painter.drawLine(
+            option.rect.bottomLeft(), option.rect.bottomRight()
+        )
+        font = QFont(option.font)
+        font.setBold(True)
+        size = font.pointSizeF()
+        if size > 0:
+            font.setPointSizeF(max(7.0, size - 0.5))
+        painter.setFont(font)
+        painter.setPen(QColor(theme.group_text))
+        text = str(index.data(Qt.ItemDataRole.DisplayRole) or "").upper()
+        rect = option.rect.adjusted(8, 0, -8, 0)
+        painter.drawText(
+            rect,
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignVCenter
+            | Qt.TextFlag.TextSingleLine,
+            text,
+        )
+        painter.restore()
+
+    def _paint_item(self, painter, option, index):
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        opt.text = ""
+        style = opt.widget.style() if opt.widget is not None else (
+            QApplication.style()
+        )
+        style.drawControl(
+            QStyle.ControlElement.CE_ItemViewItem,
+            opt,
+            painter,
+            opt.widget,
+        )
+
+        title = str(index.data(LIST_TITLE_ROLE) or "")
+        meta = str(index.data(LIST_META_ROLE) or "")
+        rating = str(index.data(LIST_RATING_ROLE) or "").strip()
+        if not title and not meta and not rating:
+            return
+        selected = bool(
+            option.state & QStyle.StateFlag.State_Selected
+        )
+        palette = option.palette
+        title_color = palette.color(
+            QPalette.ColorRole.HighlightedText
+            if selected else QPalette.ColorRole.Text
+        )
+        theme = app_theme.current_theme()
+        meta_color = (
+            QColor(title_color)
+            if selected else QColor(theme.muted)
+        )
+        rating_color = (
+            QColor(title_color)
+            if selected else QColor(theme.rating)
+        )
+
+        title_font, meta_font = list_fonts(option.font)
+        pad_x = 8
+        pad_y = 4
+        inner = option.rect.adjusted(pad_x, pad_y, -pad_x, -pad_y)
+        if inner.width() <= 0 or inner.height() <= 0:
+            return
+        title_h = min(21, max(16, inner.height() - 14))
+        title_rect = QRect(
+            inner.left(), inner.top(), inner.width(), title_h
+        )
+        meta_rect = QRect(
+            inner.left(),
+            title_rect.bottom() + 1,
+            inner.width(),
+            max(12, inner.bottom() - title_rect.bottom()),
+        )
+
+        painter.save()
+        painter.setClipRect(option.rect)
+        painter.setFont(title_font)
+        painter.setPen(title_color)
+        painter.drawText(
+            title_rect,
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignVCenter
+            | Qt.TextFlag.TextSingleLine,
+            title,
+        )
+
+        rating_text = f"★ {rating}" if rating else ""
+        if meta or rating_text:
+            painter.setFont(meta_font)
+            metrics = QFontMetrics(meta_font)
+            x = meta_rect.left()
+            line_rect = QRect(
+                x, meta_rect.top(), meta_rect.width(), meta_rect.height()
+            )
+            if meta:
+                painter.setPen(meta_color)
+                painter.drawText(
+                    line_rect,
+                    Qt.AlignmentFlag.AlignLeft
+                    | Qt.AlignmentFlag.AlignVCenter
+                    | Qt.TextFlag.TextSingleLine,
+                    meta,
+                )
+                x += metrics.horizontalAdvance(meta)
+                if rating_text:
+                    sep = " · "
+                    painter.drawText(
+                        QRect(
+                            x, meta_rect.top(),
+                            meta_rect.width(), meta_rect.height(),
+                        ),
+                        Qt.AlignmentFlag.AlignLeft
+                        | Qt.AlignmentFlag.AlignVCenter
+                        | Qt.TextFlag.TextSingleLine,
+                        sep,
+                    )
+                    x += metrics.horizontalAdvance(sep)
+            if rating_text:
+                painter.setPen(rating_color)
+                painter.drawText(
+                    QRect(
+                        x, meta_rect.top(),
+                        meta_rect.width(), meta_rect.height(),
+                    ),
+                    Qt.AlignmentFlag.AlignLeft
+                    | Qt.AlignmentFlag.AlignVCenter
+                    | Qt.TextFlag.TextSingleLine,
+                    rating_text,
+                )
+        painter.restore()
 
 
 class VideoOverlay(QLabel):
@@ -1648,9 +1872,10 @@ class HideIPDialog(QDialog):
         self.resize(840, 600)
 
         root = QVBoxLayout(self)
+        theme = app_theme.current_theme()
         title = QLabel(HIDEIP_HEADER)
         title.setStyleSheet(
-            "font-size:15px; font-weight:600; color:#333;"
+            f"font-size:15px; font-weight:600; color:{theme.text};"
         )
         root.addWidget(title)
 
@@ -1714,7 +1939,7 @@ class HideIPDialog(QDialog):
 
         bottom = QHBoxLayout()
         self.count_label = QLabel("Загрузка списка…")
-        self.count_label.setStyleSheet("color:#777;")
+        self.count_label.setStyleSheet(f"color:{theme.muted};")
         bottom.addWidget(self.count_label, 1)
         self.reset_btn = QPushButton("Сбросить")
         self.reset_btn.setToolTip(
@@ -2045,16 +2270,18 @@ class HideIPDialog(QDialog):
         label = "—"
         tip = "не проверялся"
 
+        theme = app_theme.current_theme()
         if status == "checking":
             label = "проверка…"
-            color = "#fff3cd"
+            color = theme.status_checking_bg
+            foreground = theme.status_checking_text
             tip = "идёт проверка"
         elif result is not None:
             checked_at = float(result.get("checked_at") or 0)
             if checked_at and time.time() - checked_at > self.CACHE_TTL:
                 label = proxy_scan.STATUS_LABELS[proxy_scan.STATUS_STALE]
-                color = "#eeeeee"
-                foreground = "#888888"
+                color = theme.status_stale_bg
+                foreground = theme.status_stale_text
                 tip = "результат старше 3 суток"
             else:
                 value = str(
@@ -2062,8 +2289,8 @@ class HideIPDialog(QDialog):
                 )
                 label = proxy_scan.STATUS_LABELS.get(value, value)
                 if value == proxy_scan.STATUS_VIDEO:
-                    color = "#d4edda"
-                    foreground = "#1b5e20"
+                    color = theme.status_video_bg
+                    foreground = theme.status_video_text
                     latency = result.get("latency_ms")
                     if latency is not None:
                         latency_text = f"{int(latency)} мс"
@@ -2071,14 +2298,14 @@ class HideIPDialog(QDialog):
                     proxy_scan.STATUS_SITE,
                     proxy_scan.STATUS_CDN,
                 ):
-                    color = "#ffe5b4"
-                    foreground = "#7a4b00"
+                    color = theme.status_site_bg
+                    foreground = theme.status_site_text
                 elif value == proxy_scan.STATUS_ERROR:
-                    color = "#f8d7da"
-                    foreground = "#842029"
+                    color = theme.status_error_bg
+                    foreground = theme.status_error_text
                 else:
-                    color = "#eeeeee"
-                    foreground = "#888888"
+                    color = theme.status_stale_bg
+                    foreground = theme.status_stale_text
                 parts = [label]
                 if result.get("media"):
                     parts.append(str(result["media"]))
@@ -2495,10 +2722,21 @@ class SettingsDialog(QDialog):
         self._check_worker = None
         self.setWindowTitle("Настройки")
         self.setModal(True)
-        self.resize(740, 520)
+        self.resize(740, 560)
+        self._suppress_theme = False
+        self._hint = None
 
         root = QVBoxLayout(self)
         grid = QGridLayout()
+
+        self.theme_label = QLabel("Тема:")
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Системная", "system")
+        self.theme_combo.addItem("Светлая", "light")
+        self.theme_combo.addItem("Тёмная", "dark")
+        self.theme_combo.setToolTip(
+            "Тема интерфейса. Применяется сразу и запоминается."
+        )
 
         self.base_label = QLabel("Зеркало:")
         self.base_edit = QLineEdit()
@@ -2589,22 +2827,24 @@ class SettingsDialog(QDialog):
             "движения мыши и появляется снова при движении."
         )
 
-        grid.addWidget(self.base_label, 0, 0)
-        grid.addWidget(self.base_edit, 0, 1, 1, 2)
-        grid.addWidget(self.proxy_check, 1, 0)
-        grid.addWidget(self.proxy_edit, 1, 1)
-        grid.addWidget(self.proxy_hideip_btn, 1, 2)
-        grid.addWidget(self.quality_label, 2, 0)
-        grid.addWidget(self.quality_combo, 2, 1)
-        grid.addWidget(self.source_label, 3, 0)
-        grid.addWidget(self.source_combo, 3, 1)
-        grid.addWidget(self.hwdec_label, 4, 0)
-        grid.addWidget(self.hwdec_combo, 4, 1)
-        grid.addWidget(self.autoplay_check, 5, 0, 1, 2)
-        grid.addWidget(self.next_timer_label, 6, 0)
-        grid.addWidget(self.next_timer_spin, 6, 1)
-        grid.addWidget(self.autoplay_last_check, 7, 0, 1, 2)
-        grid.addWidget(self.hide_cursor_check, 8, 0, 1, 2)
+        grid.addWidget(self.theme_label, 0, 0)
+        grid.addWidget(self.theme_combo, 0, 1, 1, 2)
+        grid.addWidget(self.base_label, 1, 0)
+        grid.addWidget(self.base_edit, 1, 1, 1, 2)
+        grid.addWidget(self.proxy_check, 2, 0)
+        grid.addWidget(self.proxy_edit, 2, 1)
+        grid.addWidget(self.proxy_hideip_btn, 2, 2)
+        grid.addWidget(self.quality_label, 3, 0)
+        grid.addWidget(self.quality_combo, 3, 1)
+        grid.addWidget(self.source_label, 4, 0)
+        grid.addWidget(self.source_combo, 4, 1)
+        grid.addWidget(self.hwdec_label, 5, 0)
+        grid.addWidget(self.hwdec_combo, 5, 1)
+        grid.addWidget(self.autoplay_check, 6, 0, 1, 2)
+        grid.addWidget(self.next_timer_label, 7, 0)
+        grid.addWidget(self.next_timer_spin, 7, 1)
+        grid.addWidget(self.autoplay_last_check, 8, 0, 1, 2)
+        grid.addWidget(self.hide_cursor_check, 9, 0, 1, 2)
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
 
@@ -2636,7 +2876,7 @@ class SettingsDialog(QDialog):
         actions.addStretch(1)
         root.addLayout(actions)
 
-        hint = QLabel(
+        self._hint = QLabel(
             "Сайт закрыт проверкой Anubis (proof-of-work). Клиент решает её "
             "сам, без браузера. Если домен не открывается, смените зеркало "
             "или включите прокси: он применяется ко всем запросам, включая "
@@ -2645,9 +2885,8 @@ class SettingsDialog(QDialog):
             "«Авто» сначала пробует HLS, а если первый сегмент не открылся "
             "за 10 секунд — переключается на прямой MP4."
         )
-        hint.setWordWrap(True)
-        hint.setStyleSheet("color:#777;")
-        root.addWidget(hint)
+        self._hint.setWordWrap(True)
+        root.addWidget(self._hint)
         root.addStretch(1)
 
         bb = QDialogButtonBox(
@@ -2660,10 +2899,22 @@ class SettingsDialog(QDialog):
 
         self.proxy_check.toggled.connect(self._sync_enabled)
         self.autoplay_check.toggled.connect(self._sync_enabled)
+        self.theme_combo.currentIndexChanged.connect(
+            self._on_theme_changed
+        )
         self._load()
+        self._apply_theme_styles()
 
     def _load(self):
         s = self.settings
+        self._suppress_theme = True
+        theme_idx = self.theme_combo.findData(
+            s.value("theme", "system", type=str)
+        )
+        self.theme_combo.setCurrentIndex(
+            theme_idx if theme_idx >= 0 else 0
+        )
+        self._suppress_theme = False
         self.base_edit.setText(
             s.value("base_url", core.DEFAULT_BASE, type=str)
         )
@@ -2701,6 +2952,7 @@ class SettingsDialog(QDialog):
 
     def _save(self):
         s = self.settings
+        s.setValue("theme", str(self.theme_combo.currentData() or "system"))
         s.setValue("base_url", normalize_base(self.base_edit.text()))
         s.setValue("proxy_enabled", self.proxy_check.isChecked())
         s.setValue("proxy", self.proxy_edit.text())
@@ -2724,6 +2976,44 @@ class SettingsDialog(QDialog):
         self.next_timer_spin.setEnabled(
             self.autoplay_check.isChecked()
         )
+
+    def _apply_theme_styles(self):
+        theme = app_theme.current_theme()
+        if self._hint is not None:
+            self._hint.setStyleSheet(
+                f"color:{theme.muted};"
+            )
+        self.proxy_hideip_btn.setIcon(themed_icon(
+            self,
+            ("network-server", "network-server-symbolic", "download"),
+            QStyle.StandardPixmap.SP_DriveNetIcon,
+        ))
+        self.check_btn.setIcon(themed_icon(
+            self, ("view-refresh", "view-refresh-symbolic"),
+            QStyle.StandardPixmap.SP_BrowserReload,
+        ))
+        self.reset_btn.setIcon(themed_icon(
+            self, ("edit-clear", "edit-clear-symbolic"),
+            QStyle.StandardPixmap.SP_DialogResetButton,
+        ))
+        self.cache_btn.setIcon(themed_icon(
+            self, ("user-trash", "user-trash-symbolic"),
+            QStyle.StandardPixmap.SP_TrashIcon,
+        ))
+
+    def _on_theme_changed(self):
+        if self._suppress_theme:
+            return
+        key = str(self.theme_combo.currentData() or "system")
+        self.settings.setValue("theme", key)
+        self.settings.sync()
+        app = QApplication.instance()
+        if app is not None:
+            app_theme.apply_theme(app, key)
+        win = self.win
+        if win is not None and hasattr(win, "_apply_theme_styles"):
+            win._apply_theme_styles()
+        self._apply_theme_styles()
 
     def _proxy_test_target(self) -> dict:
         win = self.win
@@ -2934,6 +3224,7 @@ class PosterDialog(QDialog):
         self.copy_image_btn.setIcon(themed_icon(
             self, ("edit-copy", "edit-copy-symbolic"),
             QStyle.StandardPixmap.SP_DialogSaveButton,
+            color="#dddddd",
         ))
         self.copy_image_btn.setEnabled(False)
         self.copy_image_btn.clicked.connect(self._copy_image)
@@ -2941,6 +3232,7 @@ class PosterDialog(QDialog):
         self.copy_link_btn.setIcon(themed_icon(
             self, ("edit-copy-link", "insert-link"),
             QStyle.StandardPixmap.SP_DialogSaveButton,
+            color="#dddddd",
         ))
         self.copy_link_btn.setEnabled(False)
         self.copy_link_btn.clicked.connect(self._copy_link)
@@ -2948,6 +3240,7 @@ class PosterDialog(QDialog):
         self.save_btn.setIcon(themed_icon(
             self, ("document-save", "document-save-symbolic"),
             QStyle.StandardPixmap.SP_DialogSaveButton,
+            color="#dddddd",
         ))
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self._save)
@@ -3263,11 +3556,17 @@ class MainWindow(QMainWindow):
         self._person_worker = None
         self._person_filter = None
         self._person_token = 0
+        self._desc_cache: Dict[str, str] = {}
+        self._desc_queue: List[str] = []
+        self._desc_pending = set()
+        self._desc_worker = None
+        self._hover_url = ""
 
         self._poster_cache: Dict[str, QPixmap] = {}
         self._poster_raw_cache: Dict[str, bytes] = {}
         self._poster_url = ""
         self._poster_dialog = None
+        self._poster_placeholder_text = ""
 
         self._fullscreen = False
         self._fs_t = 0.0
@@ -3282,6 +3581,11 @@ class MainWindow(QMainWindow):
         self._resume_timer = QTimer(self)
         self._resume_timer.setSingleShot(True)
         self._resume_timer.timeout.connect(self._on_resume_timeout)
+
+        self._desc_timer = QTimer(self)
+        self._desc_timer.setSingleShot(True)
+        self._desc_timer.setInterval(250)
+        self._desc_timer.timeout.connect(self._load_hover_description)
 
         self._pos_timer = QTimer(self)
         self._pos_timer.setInterval(10000)
@@ -3525,7 +3829,10 @@ class MainWindow(QMainWindow):
         row.setSpacing(6)
 
         self.catalog_combo = QComboBox()
-        self.catalog_combo.addItem("⭐ Избранное", "favorites")
+        self.catalog_combo.setIconSize(QSize(16, 16))
+        self.catalog_combo.addItem(
+            star_icon(True, force_draw=True), "Избранное", "favorites"
+        )
         for key, label in core.CATALOG_SECTIONS:
             self.catalog_combo.addItem(label, key)
         home_idx = self.catalog_combo.findData("home")
@@ -3635,16 +3942,36 @@ class MainWindow(QMainWindow):
 
         self.list = QTreeWidget()
         self.list.setHeaderHidden(True)
-        self.list.setUniformRowHeights(True)
+        self.list.header().setStretchLastSection(False)
+        self.list.setUniformRowHeights(False)
+        self.list.setIndentation(0)
+        self.list.setRootIsDecorated(False)
         self.list.setAlternatingRowColors(True)
         self.list.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.list.setSelectionMode(
             QAbstractItemView.SelectionMode.SingleSelection
         )
+        self.list.setItemDelegate(TwoLineItemDelegate(self.list))
+        self.list.setTextElideMode(Qt.TextElideMode.ElideNone)
+        self.list.setWordWrap(False)
+        self.list.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        self.list.setHorizontalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
+        self.list.setVerticalScrollMode(
+            QAbstractItemView.ScrollMode.ScrollPerPixel
+        )
         self.list.setMinimumWidth(280)
-        self.list.setStyleSheet("QTreeWidget::item { padding: 4px; }")
+        self.list.setStyleSheet(
+            "QTreeWidget::item { padding: 0; }"
+        )
+        self.list.setMouseTracking(True)
         self.list.itemSelectionChanged.connect(self._on_selection_changed)
         self.list.itemDoubleClicked.connect(self._on_item_double_click)
+        self.list.itemEntered.connect(self._on_list_item_entered)
+        self.list.viewport().installEventFilter(self)
 
         self.list_box = QWidget()
         list_layout = QVBoxLayout(self.list_box)
@@ -3937,6 +4264,103 @@ class MainWindow(QMainWindow):
         st = QShortcut(QKeySequence("Ctrl+,"), self)
         st.setContext(Qt.ShortcutContext.ApplicationShortcut)
         st.activated.connect(self.open_settings)
+        self._apply_theme_styles()
+
+    def _apply_theme_styles(self):
+        theme = app_theme.current_theme()
+        self.person_label.setStyleSheet(
+            f"color:{theme.muted}; font-size:11px; font-weight:600;"
+        )
+        self.meta_label.setStyleSheet(f"color:{theme.muted};")
+        self.rating_label.setStyleSheet(
+            f"color:{theme.rating}; font-weight:600;"
+        )
+        self.director_label.setStyleSheet(
+            f"QLabel {{ color:{theme.muted}; font-size:11px; }}"
+        )
+        self.actors_label.setStyleSheet(
+            f"QLabel {{ color:{theme.muted}; font-size:11px; }}"
+        )
+        self.desc.setStyleSheet(
+            f"QTextEdit {{ background:transparent; "
+            f"color:{theme.muted}; border:none; padding:0; }}"
+        )
+        self.play_btn.setStyleSheet(
+            f"QPushButton {{ background:{theme.accent}; "
+            f"color:{theme.accent_text}; border:none; "
+            f"border-radius:6px; padding:8px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:{theme.accent_hover}; }}"
+            f"QPushButton:disabled {{ background:{theme.button_bg}; "
+            f"color:{theme.disabled}; }}"
+        )
+        self.playback_label.setStyleSheet(
+            f"color:{theme.accent}; font-size:12px; font-weight:600;"
+        )
+        self.stream_status.setStyleSheet(
+            f"color:{theme.muted}; font-size:11px;"
+        )
+        if self._title_info is not None:
+            self._render_people()
+        if (
+            self.poster_label.pixmap() is None
+            or self.poster_label.pixmap().isNull()
+        ):
+            self._set_poster_placeholder(
+                self._poster_placeholder_text or "HDrezka"
+            )
+        self.refresh_btn.setIcon(themed_icon(
+            self, ("view-refresh", "view-refresh-symbolic"),
+            QStyle.StandardPixmap.SP_BrowserReload,
+        ))
+        self.more_btn.setIcon(themed_icon(
+            self, ("go-down", "go-down-symbolic", "view-more"),
+            QStyle.StandardPixmap.SP_ArrowDown,
+        ))
+        self.list_btn.setIcon(themed_icon(
+            self, ("view-list", "view-list-symbolic"),
+            QStyle.StandardPixmap.SP_FileDialogListView,
+        ))
+        self.info_btn.setIcon(themed_icon(
+            self, ("dialog-information", "dialog-information-symbolic"),
+            QStyle.StandardPixmap.SP_FileDialogInfoView,
+        ))
+        self.fs_btn.setIcon(themed_icon(
+            self, ("view-fullscreen", "view-fullscreen-symbolic"),
+            QStyle.StandardPixmap.SP_TitleBarMaxButton,
+        ))
+        self.person_reset_btn.setIcon(themed_icon(
+            self, ("edit-undo", "edit-undo-symbolic"),
+            QStyle.StandardPixmap.SP_DialogResetButton,
+        ))
+        self.play_btn.setIcon(themed_icon(
+            self, ("media-playback-start", "media-playback-start-symbolic"),
+            QStyle.StandardPixmap.SP_MediaPlay,
+            color=theme.accent_text,
+        ))
+        self.copy_btn.setIcon(themed_icon(
+            self, ("edit-copy", "edit-copy-symbolic"),
+            QStyle.StandardPixmap.SP_DialogSaveButton,
+        ))
+        if hasattr(self, "list"):
+            self.list.viewport().update()
+
+    def eventFilter(self, obj, event):
+        if (
+            getattr(self, "list", None) is not None
+            and obj is self.list.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            QTimer.singleShot(0, self._adjust_list_width)
+        return super().eventFilter(obj, event)
+
+    def _adjust_list_width(self):
+        if not hasattr(self, "list"):
+            return
+        available = max(280, self.list.viewport().width())
+        content = int(getattr(self, "_list_content_width", 0) or 0)
+        width = max(available, content)
+        if self.list.columnWidth(0) != width:
+            self.list.setColumnWidth(0, width)
 
     # ---------- кэш ----------
     def _load_cache(self):
@@ -4507,9 +4931,11 @@ class MainWindow(QMainWindow):
     def _person_link(self, role: str, url: str, name: str) -> str:
         quoted = urllib.parse.quote(url or "", safe="")
         label = html_module.escape(name or url or "")
+        theme = app_theme.current_theme()
         return (
             f'<a href="person:{role}:{quoted}" '
-            f'style="color:#2a6f9e; text-decoration:none;">{label}</a>'
+            f'style="color:{theme.link}; text-decoration:none;">'
+            f'{label}</a>'
         )
 
     def _person_name(self, role: str, url: str) -> str:
@@ -5236,46 +5662,81 @@ class MainWindow(QMainWindow):
         current = self._current_url if select_url is None else select_url
         self._suppress_selection = True
         self.list.clear()
+        self._list_content_width = 0
+
+        title_font, meta_font = list_fonts(self.list.font())
+        title_metrics = QFontMetrics(title_font)
+        meta_metrics = QFontMetrics(meta_font)
+        group_font = QFont(self.list.font())
+        group_font.setBold(True)
+        group_size = group_font.pointSizeF()
+        if group_size > 0:
+            group_font.setPointSizeF(max(7.0, group_size - 0.5))
+        group_metrics = QFontMetrics(group_font)
+        content_width = 0
 
         groups: Dict[str, List[core.SearchItem]] = {}
         for item in items:
             groups.setdefault(item.kind or "Другое", []).append(item)
 
         for kind in sorted(groups, key=core._kinds_key):
-            group = QTreeWidgetItem([kind])
+            kind_text = str(kind or "Другое")
+            group_text = LIST_GROUP_TITLES.get(kind_text, kind_text)
+            group = QTreeWidgetItem([group_text])
+            group.setData(0, LIST_GROUP_ROLE, True)
             font = group.font(0)
             font.setBold(True)
             group.setFont(0, font)
             group.setFlags(group.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            group.setToolTip(0, f"{kind}: {len(groups[kind])}")
+            group.setToolTip(0, f"{group_text}: {len(groups[kind])}")
+            content_width = max(
+                content_width,
+                group_metrics.horizontalAdvance(group_text.upper()),
+            )
             for item in groups[kind]:
-                label = item.title
+                meta_parts = []
                 if item.year:
-                    label = f"{label} ({item.year})"
+                    meta_parts.append(str(item.year))
                 if item.genres:
-                    label = f"{label}  ·  {item.genres}"
+                    meta_parts.append(str(item.genres))
+                meta_text = " · ".join(meta_parts)
                 rating_text = (item.rating or "").strip()
                 try:
                     float(rating_text)
                 except (TypeError, ValueError):
                     rating_text = ""
-                if rating_text:
-                    label = f"{label}  ·  ★ {rating_text}"
-                node = QTreeWidgetItem([label])
+
+                node = QTreeWidgetItem([item.title])
+                node.setData(0, LIST_TITLE_ROLE, item.title)
+                node.setData(0, LIST_META_ROLE, meta_text)
+                node.setData(0, LIST_RATING_ROLE, rating_text)
                 node.setData(
                     0, Qt.ItemDataRole.UserRole, item.to_dict()
                 )
-                tip = []
-                if item.meta:
-                    tip.append(item.meta)
-                if item.rating:
-                    tip.append("Рейтинг: " + item.rating)
-                if item.info:
-                    tip.append(item.info)
-                node.setToolTip(0, "\n".join(tip) or item.title)
+                desc = self._desc_cache.get(item.url)
+                node.setToolTip(
+                    0,
+                    self._format_description(desc)
+                    if desc is not None else "",
+                )
+
+                row_width = title_metrics.horizontalAdvance(item.title)
+                meta_width = meta_metrics.horizontalAdvance(meta_text)
+                if meta_text and rating_text:
+                    meta_width += meta_metrics.horizontalAdvance(" · ")
+                if rating_text:
+                    meta_width += meta_metrics.horizontalAdvance(
+                        f"★ {rating_text}"
+                    )
+                content_width = max(
+                    content_width, row_width, meta_width
+                )
                 group.addChild(node)
             self.list.addTopLevelItem(group)
             group.setExpanded(True)
+
+        self._list_content_width = int(content_width) + 20
+        self._adjust_list_width()
 
         self._suppress_selection = False
 
@@ -5298,6 +5759,102 @@ class MainWindow(QMainWindow):
         if target is not None:
             self.list.setCurrentItem(target)
             self.list.scrollToItem(target)
+
+    # ---------- описание в tooltip ----------
+    @staticmethod
+    def _format_description(text) -> str:
+        value = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not value:
+            return "Описание отсутствует."
+        if len(value) > 1600:
+            value = value[:1600].rsplit(" ", 1)[0] + "…"
+        return textwrap.fill(value, width=80)
+
+    def _set_item_tooltip(self, url: str, text: str):
+        if not url:
+            return
+        for i in range(self.list.topLevelItemCount()):
+            group = self.list.topLevelItem(i)
+            for j in range(group.childCount()):
+                node = group.child(j)
+                data = node.data(0, Qt.ItemDataRole.UserRole)
+                if (
+                    isinstance(data, dict)
+                    and str(data.get("url") or "") == url
+                ):
+                    node.setToolTip(0, text)
+
+    def _on_list_item_entered(self, item, _column):
+        if item is None or item.data(0, LIST_GROUP_ROLE):
+            return
+        data = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict):
+            return
+        url = str(data.get("url") or "")
+        if not url:
+            return
+        self._hover_url = url
+        desc = self._desc_cache.get(url)
+        if desc is not None:
+            item.setToolTip(0, self._format_description(desc))
+            return
+        item.setToolTip(0, "Загрузка описания…")
+        self._desc_timer.start()
+
+    def _load_hover_description(self):
+        url = self._hover_url
+        if not url:
+            return
+        desc = self._desc_cache.get(url)
+        if desc is not None:
+            self._set_item_tooltip(url, self._format_description(desc))
+            return
+        self._request_description(url)
+
+    def _request_description(self, url: str):
+        if (
+            not url
+            or url in self._desc_cache
+            or url in self._desc_pending
+            or self._closing
+        ):
+            return
+        if len(self._desc_queue) >= 12:
+            old = self._desc_queue.pop(0)
+            self._desc_pending.discard(old)
+        self._desc_queue.append(url)
+        self._desc_pending.add(url)
+        self._start_desc_worker()
+
+    def _start_desc_worker(self):
+        if (
+            self._closing
+            or self._desc_worker is not None
+            or not self._desc_queue
+        ):
+            return
+        url = self._desc_queue.pop(0)
+        worker = TitleWorker(self.client, url, self)
+        self._desc_worker = worker
+        self._track_worker(worker)
+        worker.done.connect(self._on_desc_done)
+        worker.start()
+
+    def _on_desc_done(self, url: str, result):
+        self._desc_worker = None
+        self._desc_pending.discard(url)
+        info = (result or {}).get("info")
+        if info is not None:
+            desc = getattr(info, "description", "") or ""
+            self._desc_cache[url] = desc
+            self._set_item_tooltip(
+                url, self._format_description(desc)
+            )
+        else:
+            self._set_item_tooltip(
+                url, "Не удалось загрузить описание"
+            )
+        self._start_desc_worker()
 
     def _find_item(self, url: str):
         if not url:
@@ -5338,7 +5895,9 @@ class MainWindow(QMainWindow):
         self._current_url = url
         self._load_title(url)
 
-    def _on_item_double_click(self, _item, _column):
+    def _on_item_double_click(self, item, _column):
+        if item is not None and item.data(0, LIST_GROUP_ROLE):
+            return
         if self._title_info is not None:
             self._play_current()
         else:
@@ -5441,6 +6000,10 @@ class MainWindow(QMainWindow):
         self._title_info = info
         self._update_fav_button()
         self._render_people()
+        self._desc_cache[info.url] = info.description or ""
+        self._set_item_tooltip(
+            info.url, self._format_description(info.description)
+        )
         if self._is_favorite(info.post_id):
             cache = self._load_favorites_cache()
             cache[str(info.post_id)] = self._favorite_meta_from_info(info)
@@ -6168,16 +6731,20 @@ class MainWindow(QMainWindow):
 
     # ---------- постер ----------
     def _set_poster_placeholder(self, name: str):
+        theme = app_theme.current_theme()
+        self._poster_placeholder_text = name or ""
         self.poster_label.setPixmap(QPixmap())
         self.poster_label.setText(initials(name))
         self.poster_label.setStyleSheet(
-            "background:#e7edf0; border-radius:8px; color:#5b6b73; "
+            f"background:{theme.placeholder_bg}; border-radius:8px; "
+            f"color:{theme.placeholder_text}; "
             "font-weight:600; font-size:22px;"
         )
 
     def _apply_poster(self, pix: QPixmap):
         if pix is None or pix.isNull():
             return
+        self._poster_placeholder_text = ""
         self.poster_label.setText("")
         self.poster_label.setStyleSheet(
             "background:transparent; border-radius:8px;"
@@ -6623,8 +7190,13 @@ def main() -> int:
     QApplication.setApplicationName(APP_NAME)
     QApplication.setOrganizationName(ORG_NAME)
     app = QApplication(sys.argv)
+    app_theme.capture_system_theme(app)
     app.setStyle("Fusion")
     app.setApplicationDisplayName(APP_TITLE)
+    startup_settings = QSettings(ORG_NAME, APP_NAME)
+    app_theme.apply_theme(
+        app, startup_settings.value("theme", "system", type=str)
+    )
     setup_faulthandler()
     setup_excepthook()
     try:

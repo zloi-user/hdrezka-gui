@@ -69,6 +69,21 @@ SECTION_PATHS = {
     "home": "",
 }
 
+# На страницах «Лучшее» сайт иногда подмешивает тайтлы из другого
+# раздела. Для выбранного раздела оставляем только его типы.
+SECTION_KINDS = {
+    "films": {"Фильм"},
+    "series": {"Сериал"},
+    "cartoons": {"Мультфильм"},
+    "anime": {"Аниме"},
+    "animation": {"Аниме"},
+    "show": {"ТВ-шоу"},
+}
+ALL_KINDS = {
+    "Фильм", "Сериал", "Мультфильм", "Аниме",
+    "ТВ-шоу", "Документальный",
+}
+
 # Эти пункты меню — не жанры, а язык/происхождение.
 GENRE_EXCLUDE = {"russian", "ukrainian", "foreign"}
 
@@ -1155,6 +1170,13 @@ class HDrezkaClient:
         if resp.status_code >= 400:
             raise HDrezkaError(f"HTTP {resp.status_code} для {path}")
         items = parse_catalog_html(resp.text, self.base)
+        allowed_kinds = SECTION_KINDS.get(section)
+        if allowed_kinds:
+            items = [
+                item for item in items
+                if item.kind not in ALL_KINDS
+                or item.kind in allowed_kinds
+            ]
         has_more = bool(
             re.search(rf'href="[^"]*page/{page + 1}/"', resp.text)
         )
