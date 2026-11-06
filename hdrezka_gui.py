@@ -72,6 +72,7 @@ except ImportError:  # pragma: no cover
     sys.exit("Не найден PyQt6. Установите: python3 -m pip install PyQt6")
 
 import hdrezka_core as core
+import proxy_scanner as proxy_scan
 from proxy_bridge import ProxyBridge
 from screen_inhibitor import ScreenInhibitor
 
@@ -238,6 +239,10 @@ def favorites_file() -> str:
 
 def favorites_cache_file() -> str:
     return os.path.join(cache_dir(), "favorites_cache.json")
+
+
+def proxies_cache_file() -> str:
+    return os.path.join(cache_dir(), "proxies.json")
 
 
 def initials(name: str) -> str:
@@ -698,11 +703,18 @@ class PersonWorker(QThread):
 
 
 _PROXY_WORKERS = set()
+_SCAN_WORKERS = set()
 
 
 def _forget_worker(worker):
     _PROXY_WORKERS.discard(worker)
     worker.deleteLater()
+
+
+def _forget_scan_worker(worker):
+    # Не удаляем QThread сразу: после паузы дочерние потоки могут
+    # ещё завершать сетевые операции. Python сам освободит объект.
+    _SCAN_WORKERS.discard(worker)
 
 
 # --------------------------------------------------------------------------
@@ -1598,19 +1610,42 @@ class Player(QObject):
 # --------------------------------------------------------------------------
 
 class HideIPDialog(QDialog):
-    """Таблица HTTPS-прокси с фильтром по стране."""
+    """Таблица HTTPS-прокси с фильтром и подбором рабочего."""
 
-    def __init__(self, proxy: Optional[str] = None, parent=None):
+    CACHE_TTL = 3 * 24 * 60 * 60
+
+    def __init__(self, proxy: Optional[str] = None, parent=None, target=None):
         super().__init__(parent)
         self._proxy = proxy or ""
+        self._target = dict(target or {})
         self._entries = []
         self._worker = None
         self._token = 0
         self.selected_proxy = ""
+        self._items_by_url = {}
+        self._results = {}
+        self._scan = None
+        self._scanning = False
+        self._stop_requested = False
+        self._accept_results = False
+        self._closing = False
+        self._checking_urls = set()
+        self._scanner = None
+        self._scrolled_checking = False
+        self._scrolled_found = False
+        self._auto_pause_found = False
+        self._run_found = 0
+        self._loading = False
+        self._cache_path = proxies_cache_file()
+        self._load_cache()
+        self._save_timer = QTimer(self)
+        self._save_timer.setSingleShot(True)
+        self._save_timer.setInterval(1000)
+        self._save_timer.timeout.connect(self._save_cache)
 
         self.setWindowTitle("HTTPS-прокси от hideip.me")
         self.setModal(True)
-        self.resize(700, 560)
+        self.resize(840, 600)
 
         root = QVBoxLayout(self)
         title = QLabel(HIDEIP_HEADER)
@@ -1640,11 +1675,14 @@ class HideIPDialog(QDialog):
         self.refresh_btn.setToolTip(
             "Заново загрузить список с hideip.me"
         )
+        self.refresh_btn.clicked.connect(self._refresh_list)
         filters.addWidget(self.refresh_btn)
         root.addLayout(filters)
 
-        self.table = QTableWidget(0, 2)
-        self.table.setHorizontalHeaderLabels(["IP:порт", "Страна"])
+        self.table = QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["IP:порт", "Страна", "Статус", "Задержка"]
+        )
         self.table.setSelectionBehavior(
             QAbstractItemView.SelectionBehavior.SelectRows
         )
@@ -1657,12 +1695,18 @@ class HideIPDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         self.table.verticalHeader().setVisible(False)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(
             1, QHeaderView.ResizeMode.ResizeToContents
         )
+        header.setSectionResizeMode(
+            2, QHeaderView.ResizeMode.Fixed
+        )
+        header.resizeSection(2, 120)
+        header.setSectionResizeMode(
+            3, QHeaderView.ResizeMode.Fixed
+        )
+        header.resizeSection(3, 90)
         self.table.setToolTip(
             "Двойной клик по строке — выбрать прокси"
         )
@@ -1672,6 +1716,23 @@ class HideIPDialog(QDialog):
         self.count_label = QLabel("Загрузка списка…")
         self.count_label.setStyleSheet("color:#777;")
         bottom.addWidget(self.count_label, 1)
+        self.reset_btn = QPushButton("Сбросить")
+        self.reset_btn.setToolTip(
+            "Сбросить проверку и вернуться к выбору"
+        )
+        self.reset_btn.setVisible(False)
+        self.reset_btn.clicked.connect(self._reset_scan)
+        bottom.addWidget(self.reset_btn)
+        self.scan_btn = QPushButton("Подобрать рабочий")
+        self.scan_btn.setIcon(themed_icon(
+            self, ("system-search", "edit-find"),
+            QStyle.StandardPixmap.SP_FileDialogContentsView,
+        ))
+        self.scan_btn.setToolTip(
+            "Проверить прокси сверху вниз и найти рабочие"
+        )
+        self.scan_btn.clicked.connect(self._on_scan_clicked)
+        bottom.addWidget(self.scan_btn)
         self.pick_btn = QPushButton("Выбрать")
         self.pick_btn.setDefault(True)
         self.pick_btn.setEnabled(False)
@@ -1684,7 +1745,6 @@ class HideIPDialog(QDialog):
             self._apply_filter
         )
         self.search_edit.textChanged.connect(self._apply_filter)
-        self.refresh_btn.clicked.connect(self._load)
         self.pick_btn.clicked.connect(self._accept_selected)
         self.cancel_btn.clicked.connect(self.reject)
         self.table.itemSelectionChanged.connect(
@@ -1696,6 +1756,69 @@ class HideIPDialog(QDialog):
 
         self._load()
 
+    # ---------- кэш ----------
+    def _load_cache(self):
+        try:
+            with open(self._cache_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        raw_results = data.get("results")
+        if isinstance(raw_results, dict):
+            for url, result in raw_results.items():
+                if isinstance(result, dict):
+                    self._results[str(url)] = result
+        raw_scan = data.get("scan")
+        if not isinstance(raw_scan, dict):
+            return
+        updated = float(
+            raw_scan.get("updated_at")
+            or raw_scan.get("created_at")
+            or 0
+        )
+        if time.time() - updated > self.CACHE_TTL:
+            return
+        for key in ("candidate_urls", "checked_urls"):
+            value = raw_scan.get(key)
+            if not isinstance(value, list):
+                value = []
+            raw_scan[key] = [str(x) for x in value if x]
+        if not isinstance(raw_scan.get("test"), dict):
+            raw_scan["test"] = {}
+        try:
+            raw_scan["found"] = int(raw_scan.get("found") or 0)
+        except (TypeError, ValueError):
+            raw_scan["found"] = 0
+        self._scan = raw_scan
+
+    def _save_cache(self):
+        self._save_timer.stop()
+        data = {
+            "version": 1,
+            "updated_at": int(time.time()),
+            "results": self._results,
+            "scan": self._scan,
+        }
+        tmp = self._cache_path + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, indent=1)
+                fh.write("\n")
+            os.replace(tmp, self._cache_path)
+        except OSError as e:
+            _log("proxy cache save:", e)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _schedule_save(self):
+        if not self._save_timer.isActive():
+            self._save_timer.start()
+
+    # ---------- таблица ----------
     @staticmethod
     def _url_key(value) -> str:
         text = str(value or "").strip().lower()
@@ -1708,10 +1831,22 @@ class HideIPDialog(QDialog):
             bool(self.table.selectionModel().selectedRows())
         )
 
+    def _visible_urls(self) -> List[str]:
+        urls = []
+        for row in range(self.table.rowCount()):
+            if self.table.isRowHidden(row):
+                continue
+            item = self.table.item(row, 0)
+            if item is None:
+                continue
+            url = item.data(Qt.ItemDataRole.UserRole)
+            if url:
+                urls.append(str(url))
+        return urls
+
     def _apply_filter(self):
         country = str(self.country_combo.currentData() or "")
         needle = self.search_edit.text().strip().lower()
-        shown = 0
         self.table.setUpdatesEnabled(False)
         self.table.clearSelection()
         try:
@@ -1730,16 +1865,10 @@ class HideIPDialog(QDialog):
                     )
                     ok = needle in haystack
                 self.table.setRowHidden(row, not ok)
-                if ok:
-                    shown += 1
         finally:
             self.table.setUpdatesEnabled(True)
-        total = self.table.rowCount()
-        if total:
-            self.count_label.setText(
-                f"Показано {shown} из {total}"
-            )
         self._update_pick_enabled()
+        self._update_progress()
 
     def _fill_countries(self):
         previous = str(self.country_combo.currentData() or "")
@@ -1764,19 +1893,31 @@ class HideIPDialog(QDialog):
         finally:
             self.country_combo.blockSignals(False)
 
+    # ---------- загрузка списка ----------
+    def _refresh_list(self):
+        if self._scanning or self._loading:
+            return
+        if self._scan is not None:
+            self._reset_scan()
+        self._load()
+
     def _load(self):
         try:
             if self._worker is not None and self._worker.isRunning():
                 return
         except RuntimeError:
             self._worker = None
+        self._loading = True
         self._token += 1
         token = self._token
-        self.refresh_btn.setEnabled(False)
         self.pick_btn.setEnabled(False)
         self.count_label.setText("Загрузка списка…")
         self.count_label.setToolTip("")
         self.table.setRowCount(0)
+        self._items_by_url = {}
+        self._update_controls()
+        self._update_buttons()
+        self._update_progress()
         worker = ProxyListWorker(token, self._proxy)
         self._worker = worker
         _PROXY_WORKERS.add(worker)
@@ -1788,34 +1929,519 @@ class HideIPDialog(QDialog):
         if token != self._token:
             return
         self._worker = None
-        self.refresh_btn.setEnabled(True)
+        self._loading = False
         if error:
-            self.count_label.setText(
-                "Не удалось загрузить список"
-            )
+            self.count_label.setText("Не удалось загрузить список")
             self.count_label.setToolTip(error)
+            self._update_controls()
+            self._update_buttons()
+            self._update_progress()
             return
         self._entries = list(entries or [])
+        self._fill_countries()
         if not self._entries:
             self.count_label.setText("Список пуст")
+            self._update_controls()
+            self._update_buttons()
             return
 
         self.table.setSortingEnabled(False)
         self.table.setRowCount(len(self._entries))
+        self._items_by_url = {}
         for row, (url, label, country) in enumerate(self._entries):
             host = urllib.parse.urlparse(url).netloc or label
             ip_item = QTableWidgetItem(host)
             ip_item.setData(Qt.ItemDataRole.UserRole, url)
             ip_item.setToolTip(url)
             country_item = QTableWidgetItem(country or "—")
+            status_item = QTableWidgetItem("—")
+            status_item.setToolTip("не проверялся")
+            latency_item = QTableWidgetItem("—")
+            latency_item.setTextAlignment(
+                Qt.AlignmentFlag.AlignRight
+                | Qt.AlignmentFlag.AlignVCenter
+            )
             self.table.setItem(row, 0, ip_item)
             self.table.setItem(row, 1, country_item)
+            self.table.setItem(row, 2, status_item)
+            self.table.setItem(row, 3, latency_item)
+            self._items_by_url[str(url)] = {
+                "ip": ip_item,
+                "country": country_item,
+                "status": status_item,
+                "latency": latency_item,
+            }
         self.table.setSortingEnabled(True)
         self.table.sortItems(1, Qt.SortOrder.AscendingOrder)
-        self._fill_countries()
+        self._reconcile_scan()
+        self._apply_cached_results()
         self._apply_filter()
         self._select_current_proxy()
+        self._update_controls()
+        self._update_buttons()
+        self._update_progress()
 
+    def _reconcile_scan(self):
+        if not self._scan:
+            return
+        candidates = [
+            url for url in self._scan.get("candidate_urls", [])
+            if url in self._items_by_url
+        ]
+        if not candidates:
+            self._scan = None
+            return
+        checked = []
+        now = time.time()
+        for url in self._scan.get("checked_urls", []):
+            if url not in candidates:
+                continue
+            result = self._results.get(url)
+            if not isinstance(result, dict):
+                continue
+            checked_at = float(result.get("checked_at") or 0)
+            if checked_at and now - checked_at > self.CACHE_TTL:
+                continue
+            checked.append(url)
+        self._scan["candidate_urls"] = candidates
+        self._scan["checked_urls"] = checked
+        found = sum(
+            1 for url in checked
+            if self._results.get(url, {}).get("status")
+            == proxy_scan.STATUS_VIDEO
+        )
+        self._scan["found"] = found
+        if self._scan.get("finished") and len(checked) < len(candidates):
+            self._scan["finished"] = False
+            self._scan["paused"] = True
+        if not self._scan.get("finished") and not self._scan.get("paused"):
+            self._scan["paused"] = True
+
+    def _apply_cached_results(self):
+        if self._scan:
+            urls = list(self._scan.get("checked_urls", []))
+        else:
+            urls = list(self._items_by_url)
+        for url in urls:
+            result = self._results.get(url)
+            if result:
+                self._set_row_status(url, result=result)
+            else:
+                self._set_row_status(url)
+
+    # ---------- отображение статусов ----------
+    def _set_row_status(
+        self,
+        url: str,
+        status: Optional[str] = None,
+        result: Optional[dict] = None,
+    ):
+        bundle = self._items_by_url.get(str(url))
+        if not bundle:
+            return
+        color = None
+        foreground = None
+        latency_text = "—"
+        label = "—"
+        tip = "не проверялся"
+
+        if status == "checking":
+            label = "проверка…"
+            color = "#fff3cd"
+            tip = "идёт проверка"
+        elif result is not None:
+            checked_at = float(result.get("checked_at") or 0)
+            if checked_at and time.time() - checked_at > self.CACHE_TTL:
+                label = proxy_scan.STATUS_LABELS[proxy_scan.STATUS_STALE]
+                color = "#eeeeee"
+                foreground = "#888888"
+                tip = "результат старше 3 суток"
+            else:
+                value = str(
+                    result.get("status") or proxy_scan.STATUS_ERROR
+                )
+                label = proxy_scan.STATUS_LABELS.get(value, value)
+                if value == proxy_scan.STATUS_VIDEO:
+                    color = "#d4edda"
+                    foreground = "#1b5e20"
+                    latency = result.get("latency_ms")
+                    if latency is not None:
+                        latency_text = f"{int(latency)} мс"
+                elif value in (
+                    proxy_scan.STATUS_SITE,
+                    proxy_scan.STATUS_CDN,
+                ):
+                    color = "#ffe5b4"
+                    foreground = "#7a4b00"
+                elif value == proxy_scan.STATUS_ERROR:
+                    color = "#f8d7da"
+                    foreground = "#842029"
+                else:
+                    color = "#eeeeee"
+                    foreground = "#888888"
+                parts = [label]
+                if result.get("media"):
+                    parts.append(str(result["media"]))
+                site_ms = result.get("site_ms")
+                if site_ms is not None:
+                    parts.append(f"сайт: {int(site_ms)} мс")
+                video_ms = result.get("video_ms")
+                if video_ms is not None:
+                    parts.append(f"видео: {int(video_ms)} мс")
+                if result.get("latency_ms") is not None:
+                    parts.append(
+                        f"полное время: {int(result['latency_ms'])} мс"
+                    )
+                if result.get("error"):
+                    parts.append("ошибка: " + str(result["error"]))
+                if checked_at:
+                    parts.append("проверено: " + fmt_ts(checked_at))
+                tip = "\n".join(parts)
+        elif status:
+            label = proxy_scan.STATUS_LABELS.get(status, status)
+
+        bundle["status"].setText(label)
+        bundle["latency"].setText(latency_text)
+        if color:
+            brush = QBrush(QColor(color))
+            for item in bundle.values():
+                item.setBackground(brush)
+        else:
+            for item in bundle.values():
+                item.setData(Qt.ItemDataRole.BackgroundRole, None)
+        if foreground:
+            bundle["status"].setForeground(QBrush(QColor(foreground)))
+        else:
+            bundle["status"].setData(
+                Qt.ItemDataRole.ForegroundRole, None
+            )
+        for key in ("ip", "country", "status", "latency"):
+            bundle[key].setToolTip(tip)
+
+    def _scroll_to_url(self, url: str):
+        bundle = self._items_by_url.get(str(url))
+        if not bundle:
+            return
+        self.table.scrollToItem(
+            bundle["ip"],
+            QAbstractItemView.ScrollHint.PositionAtCenter,
+        )
+
+    # ---------- прогресс/кнопки ----------
+    def _update_progress(self):
+        if self._scan:
+            total = len(self._scan.get("candidate_urls", []))
+            checked = len(self._scan.get("checked_urls", []))
+            found = int(self._scan.get("found") or 0)
+            text = f"Проверено {checked} из {total} · найдено {found}"
+            if self._scanning:
+                if self._stop_requested:
+                    text += " · останавливаюсь…"
+                else:
+                    text += (
+                        f" · проверяется {len(self._checking_urls)}"
+                    )
+            elif self._scan.get("paused"):
+                text += " · пауза"
+            elif self._scan.get("finished"):
+                text += " · готово"
+            self.count_label.setText(text)
+            return
+        total = self.table.rowCount()
+        if self._loading or not total:
+            if not total:
+                self.count_label.setText(
+                    "Загрузка списка…" if self._loading else "Список пуст"
+                )
+            return
+        visible = sum(
+            1 for row in range(total)
+            if not self.table.isRowHidden(row)
+        )
+        self.count_label.setText(f"Показано {visible} из {total}")
+
+    def _update_buttons(self):
+        if self._scanning:
+            if self._stop_requested:
+                self.scan_btn.setText("Стоп…")
+                self.scan_btn.setEnabled(False)
+            else:
+                self.scan_btn.setText("Стоп")
+                self.scan_btn.setEnabled(True)
+        elif self._scan and self._scan.get("finished"):
+            self.scan_btn.setText("Проверить заново")
+            self.scan_btn.setEnabled(
+                bool(self._items_by_url) and not self._loading
+            )
+        elif self._scan and self._scan.get("paused"):
+            self.scan_btn.setText("Продолжить")
+            self.scan_btn.setEnabled(
+                bool(self._items_by_url) and not self._loading
+            )
+        else:
+            self.scan_btn.setText("Подобрать рабочий")
+            self.scan_btn.setEnabled(
+                bool(self._items_by_url) and not self._loading
+            )
+        self.reset_btn.setVisible(
+            bool(
+                self._scan
+                and self._scan.get("paused")
+                and not self._scanning
+            )
+        )
+        self.reset_btn.setEnabled(not self._scanning)
+
+    def _update_controls(self):
+        locked = self._scanning or (
+            self._scan is not None and not self._scan.get("finished")
+        )
+        self.country_combo.setEnabled(not locked)
+        self.search_edit.setEnabled(not locked)
+        self.table.setSortingEnabled(
+            not locked and self.table.rowCount() > 0
+        )
+        self.refresh_btn.setEnabled(
+            not self._loading
+            and not self._scanning
+            and (self._scan is None or self._scan.get("finished"))
+        )
+
+    # ---------- запуск/остановка ----------
+    def _fallback_target(self) -> dict:
+        base = core.DEFAULT_BASE
+        win = getattr(self.parent(), "win", None)
+        if win is not None and getattr(win, "client", None) is not None:
+            base = win.client.base
+        base = (base or core.DEFAULT_BASE).rstrip("/")
+        return {
+            "url": base + "/films/fiction/647-avatar-2009-latest.html",
+            "base": base,
+            "translator_id": "",
+            "season": "1",
+            "episode": "1",
+            "title": "Аватар (тест)",
+        }
+
+    def _on_scan_clicked(self):
+        if self._scanning:
+            self._request_stop("stopped")
+            return
+        if (
+            self._scan
+            and self._scan.get("paused")
+            and not self._scan.get("finished")
+        ):
+            self._start_scan(resume=True)
+        else:
+            self._start_scan(resume=False)
+
+    def _start_scan(self, resume: bool):
+        if self._scanning or self._loading:
+            return
+        if resume and self._scan:
+            scan = self._scan
+            candidates = list(scan.get("candidate_urls", []))
+            checked = set(scan.get("checked_urls", []))
+            remaining = [
+                url for url in candidates if url not in checked
+            ]
+            target = dict(
+                scan.get("test") or self._target or self._fallback_target()
+            )
+            if not remaining:
+                scan["finished"] = True
+                scan["paused"] = False
+                scan["updated_at"] = time.time()
+                self._update_controls()
+                self._update_buttons()
+                self._update_progress()
+                self._save_cache()
+                return
+        else:
+            candidates = self._visible_urls()
+            if not candidates:
+                self.count_label.setText("Нет прокси для проверки")
+                return
+            target = dict(self._target or self._fallback_target())
+            for url in candidates:
+                self._results.pop(url, None)
+                self._set_row_status(url)
+            scan = {
+                "created_at": time.time(),
+                "updated_at": time.time(),
+                "candidate_urls": list(candidates),
+                "checked_urls": [],
+                "found": 0,
+                "paused": False,
+                "finished": False,
+                "test": dict(target),
+            }
+            self._scan = scan
+            remaining = list(candidates)
+
+        if not target.get("url"):
+            target = self._fallback_target()
+            scan["test"] = dict(target)
+        scan["test"] = dict(target)
+        scan["paused"] = False
+        scan["finished"] = False
+        scan["updated_at"] = time.time()
+
+        self._scanning = True
+        self._stop_requested = False
+        self._accept_results = True
+        self._checking_urls.clear()
+        self._scrolled_checking = False
+        self._scrolled_found = False
+        self._auto_pause_found = False
+        self._run_found = 0
+        self._update_controls()
+        self._update_buttons()
+        self._update_progress()
+        self._save_cache()
+
+        worker = proxy_scan.ProxyScanWorker(
+            remaining, target, parent=None
+        )
+        self._scanner = worker
+        _SCAN_WORKERS.add(worker)
+        worker.checking.connect(self._on_checking)
+        worker.result.connect(self._on_result)
+        worker.done.connect(self._on_scan_done)
+        worker.finished.connect(
+            lambda w=worker: _forget_scan_worker(w)
+        )
+        worker.start()
+
+    def _on_checking(self, url: str):
+        if not self._scanning or not self._accept_results:
+            return
+        self._checking_urls.add(str(url))
+        self._set_row_status(url, status="checking")
+        if not self._scrolled_checking:
+            self._scrolled_checking = True
+            self._scroll_to_url(url)
+        self._update_progress()
+
+    def _on_result(self, url: str, result):
+        if not self._scanning or not self._accept_results:
+            return
+        if self._auto_pause_found:
+            return
+        url = str(url)
+        self._checking_urls.discard(url)
+        data = dict(result or {})
+        data.setdefault("checked_at", int(time.time()))
+        self._results[url] = data
+        scan = self._scan
+        if scan:
+            checked = scan.setdefault("checked_urls", [])
+            if url not in checked:
+                checked.append(url)
+                if data.get("status") == proxy_scan.STATUS_VIDEO:
+                    scan["found"] = int(
+                        scan.get("found") or 0
+                    ) + 1
+                    self._run_found += 1
+                    if self._run_found >= 2:
+                        self._auto_pause_found = True
+            scan["updated_at"] = time.time()
+        self._set_row_status(url, result=data)
+        if (
+            data.get("status") == proxy_scan.STATUS_VIDEO
+            and not self._scrolled_found
+        ):
+            self._scrolled_found = True
+            self._scroll_to_url(url)
+        self._update_progress()
+        self._schedule_save()
+
+    def _on_scan_done(self, reason: str):
+        self._scanner = None
+        self._scanning = False
+        self._stop_requested = False
+        self._accept_results = False
+        for url in list(self._checking_urls):
+            self._set_row_status(url)
+        self._checking_urls.clear()
+        scan = self._scan
+        if scan:
+            all_checked = (
+                len(scan.get("checked_urls", []))
+                >= len(scan.get("candidate_urls", []))
+            )
+            if all_checked:
+                scan["finished"] = True
+                scan["paused"] = False
+            elif reason == "finished":
+                scan["finished"] = True
+                scan["paused"] = False
+            else:
+                scan["paused"] = True
+                scan["finished"] = False
+            scan["updated_at"] = time.time()
+        self._save_cache()
+        if self._closing:
+            return
+        self._update_controls()
+        self._update_buttons()
+        self._update_progress()
+
+    def _request_stop(self, reason: str):
+        if not self._scanning:
+            return
+        self._accept_results = False
+        self._stop_requested = True
+        scan = self._scan
+        if scan:
+            scan["paused"] = True
+            scan["updated_at"] = time.time()
+        for url in list(self._checking_urls):
+            self._set_row_status(url)
+        self._checking_urls.clear()
+        if self._scanner is not None:
+            self._scanner.stop(reason or "stopped")
+        else:
+            self._scanning = False
+        self._update_buttons()
+        self._update_progress()
+        self._save_cache()
+
+    def _reset_scan(self):
+        if self._scanning:
+            self._request_stop("stopped")
+            return
+        scan = self._scan
+        if scan:
+            for url in list(scan.get("candidate_urls") or []):
+                self._results.pop(url, None)
+                self._set_row_status(url)
+        self._scan = None
+        self._accept_results = False
+        self._checking_urls.clear()
+        if self._save_timer.isActive():
+            self._save_timer.stop()
+        self._save_cache()
+        self._update_controls()
+        self._update_buttons()
+        self._update_progress()
+
+    def _stop_scan_for_close(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._accept_results = False
+        if self._scanner is not None:
+            self._scanner.stop("stopped")
+        scan = self._scan
+        if scan and not scan.get("finished"):
+            scan["paused"] = True
+            scan["updated_at"] = time.time()
+        self._checking_urls.clear()
+        self._save_cache()
+
+    # ---------- выбор ----------
     def _select_current_proxy(self):
         target = self._url_key(self._proxy)
         if not target:
@@ -1846,7 +2472,19 @@ class HideIPDialog(QDialog):
         if not url:
             return
         self.selected_proxy = str(url)
+        self.accept()
+
+    def accept(self):
+        self._stop_scan_for_close()
         super().accept()
+
+    def reject(self):
+        self._stop_scan_for_close()
+        super().reject()
+
+    def closeEvent(self, event):
+        self._stop_scan_for_close()
+        super().closeEvent(event)
 
 
 class SettingsDialog(QDialog):
@@ -2087,11 +2725,60 @@ class SettingsDialog(QDialog):
             self.autoplay_check.isChecked()
         )
 
+    def _proxy_test_target(self) -> dict:
+        win = self.win
+        info = getattr(win, "_title_info", None) if win else None
+        client = getattr(win, "client", None) if win else None
+        base = (getattr(client, "base", "") or core.DEFAULT_BASE).rstrip("/")
+        if info is None or getattr(info, "coming_soon", False):
+            return {
+                "url": base + "/films/fiction/647-avatar-2009-latest.html",
+                "base": base,
+                "translator_id": "",
+                "season": "1",
+                "episode": "1",
+                "title": "Аватар (тест)",
+            }
+
+        translators = list(getattr(info, "translators", []) or [])
+        normal = [t for t in translators if not t.premium]
+        tid = ""
+        try:
+            tid = str(win.translation_combo.currentData() or "")
+        except Exception:
+            pass
+        if not tid:
+            tid = str(getattr(info, "default_translator", "") or "")
+        if not tid and translators:
+            tid = (normal or translators)[0].id
+
+        sid = "1"
+        eid = "1"
+        if getattr(info, "is_series", False):
+            try:
+                sid = str(win.season_combo.currentData() or "1")
+            except Exception:
+                sid = "1"
+            try:
+                eid = str(win.episode_combo.currentData() or "1")
+            except Exception:
+                eid = "1"
+        return {
+            "url": info.url,
+            "base": base,
+            "translator_id": tid,
+            "season": sid,
+            "episode": eid,
+            "title": info.title,
+        }
+
     def _open_hideip(self):
         proxy = None
         if self.proxy_check.isChecked():
             proxy = normalize_proxy(self.proxy_edit.text())
-        dialog = HideIPDialog(proxy, self)
+        dialog = HideIPDialog(
+            proxy, self, target=self._proxy_test_target()
+        )
         if (
             dialog.exec() == QDialog.DialogCode.Accepted
             and dialog.selected_proxy

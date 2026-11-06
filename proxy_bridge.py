@@ -327,7 +327,9 @@ class ProxyBridge:
     def _open_proxy_socket(self):
         sock = socket.create_connection((self.host, self.proxy_port), 10)
         if self.scheme == "https":
-            ctx = ssl._create_unverified_context()
+            # HTTPS-прокси: сертификат прокси намеренно не проверяем,
+            # как и сертификаты сайта/постеров в остальных запросах.
+            ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
             ctx.check_hostname = False
             ctx.verify_mode = ssl.CERT_NONE
             sock = ctx.wrap_socket(sock, server_hostname=self.host)
